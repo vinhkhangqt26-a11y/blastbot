@@ -1,0 +1,359 @@
+name: Build BlastBot APK
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Write project
+        run: |
+          mkdir -p BlastBot/app
+          cat > BlastBot/app/build.gradle.kts <<'EOF_0'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+              namespace = "com.nyx.blastbot"
+              compileSdk = 34
+              defaultConfig { applicationId = "com.nyx.blastbot"; minSdk = 30; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_0
+          mkdir -p BlastBot/app/src/main
+          cat > BlastBot/app/src/main/AndroidManifest.xml <<'EOF_1'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="BlastBot" android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".BotService" android:exported="true"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/service_config"/>
+                  </service>
+              </application>
+          </manifest>
+          EOF_1
+          mkdir -p BlastBot/app/src/main/java/com/nyx/blastbot
+          cat > BlastBot/app/src/main/java/com/nyx/blastbot/BotService.kt <<'EOF_2'
+          package com.nyx.blastbot
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.*
+          import android.os.Handler
+          import android.os.Looper
+          import android.view.Display
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.Toast
+          import java.io.File
+          import java.util.concurrent.Executors
+
+          class BotService : AccessibilityService() {
+              companion object { var inst: BotService? = null }
+              private val h = Handler(Looper.getMainLooper())
+              private val ex = Executors.newSingleThreadExecutor()
+              private lateinit var cfg: Cfg
+              private var running = false
+              private var last = ""
+              private var same = 0
+
+              override fun onServiceConnected() { inst = this; cfg = Cfg(this) }
+              override fun onUnbind(i: Intent?): Boolean { inst = null; return super.onUnbind(i) }
+              override fun onInterrupt() {}
+
+              // Auto-start when Block Blast comes to the foreground, stop when you leave it.
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  val p = e.packageName?.toString() ?: return
+                  if (p == cfg.pkg) {
+                      if (cfg.on && !running) { running = true; same = 0; last = ""; h.postDelayed({ tick() }, 2500) }
+                  } else if (p != "com.android.systemui" && !p.contains("inputmethod")) running = false
+              }
+
+              private fun shot(ok: (Bitmap) -> Unit, fail: () -> Unit) {
+                  takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
+                      override fun onSuccess(r: ScreenshotResult) {
+                          val hb = r.hardwareBuffer
+                          val bm = Bitmap.wrapHardwareBuffer(hb, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, true)
+                          hb.close()
+                          if (bm != null) ex.execute { ok(bm) } else fail()
+                      }
+                      override fun onFailure(code: Int) = fail()   // screenshots are rate-limited to ~1/s
+                  })
+              }
+
+              private fun tick() {
+                  if (!running) return
+                  shot({ work(it, false) }, { h.postDelayed({ tick() }, 1200) })
+              }
+
+              fun debugShot() {
+                  Toast.makeText(this, "Chuyen sang Block Blast, chup sau 6s", Toast.LENGTH_LONG).show()
+                  h.postDelayed({ shot({ work(it, true) }, {}) }, 6000)
+              }
+
+              private fun work(bm: Bitmap, debug: Boolean) {
+                  val v = Vision(bm, cfg); val g = v.board(); val ps = v.pieces()
+                  if (debug) { drawDebug(bm, v, g, ps); return }
+                  if (ps.all { it == null }) { h.postDelayed({ tick() }, 1000); return }  // waiting for new pieces
+                  val sig = g.joinToString { it.joinToString("") } + ps.joinToString { "${it?.cells?.size}" }
+                  same = if (sig == last) same + 1 else 0; last = sig
+                  if (same >= 3) { running = false; return }       // nothing changes: game over / ad / bad calibration
+                  val seq = Solver.plan(g, ps)
+                  if (seq == null) { running = false; return }
+                  val m = seq[0]; val s = ps[m.i]!!
+                  val x1 = v.bl + (m.c + s.w / 2f) * v.cell
+                  val y1 = v.bt + (m.r + s.h / 2f) * v.cell + cfg.f("dy") * v.cell
+                  val path = Path().apply { moveTo(s.cx, s.cy); lineTo(x1, y1) }
+                  val gd = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 400)).build()
+                  h.post {
+                      dispatchGesture(gd, object : GestureResultCallback() {
+                          override fun onCompleted(d: GestureDescription?) { h.postDelayed({ tick() }, 1100) }
+                          override fun onCancelled(d: GestureDescription?) { h.postDelayed({ tick() }, 1100) }
+                      }, null)
+                  }
+              }
+
+              private fun drawDebug(bm: Bitmap, v: Vision, g: Array<IntArray>, ps: List<Shape?>) {
+                  val c = Canvas(bm); val p = Paint().apply { strokeWidth = 4f }
+                  p.style = Paint.Style.STROKE; p.color = Color.CYAN
+                  c.drawRect(v.bl, v.bt, v.bl + v.cell * 8, v.bt + v.cell * 8, p)
+                  p.style = Paint.Style.FILL
+                  for (r in 0 until 8) for (k in 0 until 8) {
+                      p.color = if (g[r][k] == 1) Color.GREEN else Color.RED
+                      c.drawCircle(v.bl + (k + .5f) * v.cell, v.bt + (r + .5f) * v.cell, v.cell / 8, p)
+                  }
+                  p.color = Color.MAGENTA
+                  ps.forEach { s -> if (s != null) c.drawCircle(s.cx, s.cy, 16f, p) }
+                  p.style = Paint.Style.STROKE; p.color = Color.YELLOW
+                  c.drawRect(v.bl, cfg.f("ty") * v.H, v.bl + v.cell * 8, (cfg.f("ty") + cfg.f("th")) * v.H, p)
+                  File(getExternalFilesDir(null), "debug.png").outputStream().use { bm.compress(Bitmap.CompressFormat.PNG, 90, it) }
+                  h.post { Toast.makeText(this, "Da luu anh debug. Mo BlastBot de xem. Khay: " + ps.joinToString { "${it?.w}x${it?.h}" }, Toast.LENGTH_LONG).show() }
+              }
+          }
+          EOF_2
+          mkdir -p BlastBot/app/src/main/java/com/nyx/blastbot
+          cat > BlastBot/app/src/main/java/com/nyx/blastbot/Core.kt <<'EOF_3'
+          package com.nyx.blastbot
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Color
+          import kotlin.math.roundToInt
+
+          class Shape(val cells: List<IntArray>, val w: Int, val h: Int, val cx: Float = 0f, val cy: Float = 0f)
+          class Move(val i: Int, val r: Int, val c: Int)
+
+          /** Settings, all screen ratios so it works across resolutions. */
+          class Cfg(ctx: Context) {
+              private val p = ctx.getSharedPreferences("cfg", 0)
+              // bl/bt: board left/top (fraction of W/H). bs: board size (fraction of W). ty/th: tray top/height (fraction of H).
+              // ps: tray piece cell size relative to board cell. dy: extra drop offset in cells (finger lift).
+              val defaults = linkedMapOf("bl" to 0.045f, "bt" to 0.30f, "bs" to 0.91f, "ty" to 0.76f, "th" to 0.14f, "ps" to 0.62f, "dy" to 0f)
+              fun f(k: String) = p.getFloat(k, defaults[k]!!)
+              fun set(k: String, v: Float) = p.edit().putFloat(k, v).apply()
+              var pkg: String
+                  get() = p.getString("pkg", "com.block.juggle")!!
+                  set(v) = p.edit().putString("pkg", v).apply()
+              var on: Boolean
+                  get() = p.getBoolean("on", true)
+                  set(v) = p.edit().putBoolean("on", v).apply()
+          }
+
+          object Solver {
+              private const val N = 8
+              private fun fits(g: Array<IntArray>, s: Shape, r: Int, c: Int) = s.cells.all { g[r + it[0]][c + it[1]] == 0 }
+              private fun placements(g: Array<IntArray>, s: Shape): List<IntArray> {
+                  val o = ArrayList<IntArray>()
+                  for (r in 0..N - s.h) for (c in 0..N - s.w) if (fits(g, s, r, c)) o.add(intArrayOf(r, c))
+                  return o
+              }
+              private fun apply(g: Array<IntArray>, s: Shape, r: Int, c: Int): Pair<Array<IntArray>, Int> {
+                  val n = Array(N) { g[it].clone() }
+                  for (p in s.cells) n[r + p[0]][c + p[1]] = 1
+                  val rows = (0 until N).filter { i -> n[i].all { it == 1 } }
+                  val cols = (0 until N).filter { j -> (0 until N).all { n[it][j] == 1 } }
+                  for (i in rows) n[i].fill(0)
+                  for (j in cols) for (i in 0 until N) n[i][j] = 0
+                  return n to (rows.size + cols.size)
+              }
+              private fun eval(g: Array<IntArray>): Double {
+                  var p = 0.0; var f = 0
+                  val d = arrayOf(intArrayOf(1, 0), intArrayOf(-1, 0), intArrayOf(0, 1), intArrayOf(0, -1))
+                  for (r in 0 until N) for (c in 0 until N) {
+                      if (g[r][c] == 1) { f++; continue }
+                      var nb = 0
+                      for (q in d) { val a = r + q[0]; val b = c + q[1]; if (a < 0 || b < 0 || a >= N || b >= N || g[a][b] == 1) nb++ }
+                      p += if (nb == 4) 4 else if (nb == 3) 1 else 0
+                  }
+                  for (i in 0 until N) {
+                      var pr = 1; var pc = 1
+                      for (j in 0 until N) { val a = g[i][j]; val b = g[j][i]; if (a != pr) p += .5; if (b != pc) p += .5; pr = a; pc = b }
+                      if (pr != 1) p += .5; if (pc != 1) p += .5
+                  }
+                  return -p - f * .35
+              }
+              /** Searches all orders of the visible pieces (beam 8 per level) and returns the best move sequence. */
+              fun plan(g: Array<IntArray>, ps: List<Shape?>): List<Move>? {
+                  var bv = -1e18; var bs: List<Move>? = null
+                  fun rec(g: Array<IntArray>, rem: List<Int>, seq: List<Move>, bonus: Double) {
+                      var any = false
+                      for (i in rem) {
+                          val s = ps[i]!!
+                          val cand = placements(g, s).map { (r, c) ->
+                              val a = apply(g, s, r, c); Triple(intArrayOf(r, c), a, eval(a.first) + a.second * 8)
+                          }.sortedByDescending { it.third }.take(8)
+                          for (m in cand) {
+                              any = true
+                              rec(m.second.first, rem - i, seq + Move(i, m.first[0], m.first[1]), bonus + m.second.second * 8)
+                          }
+                      }
+                      if (!any && seq.isNotEmpty()) {
+                          val v = bonus + eval(g) - 60.0 * rem.size
+                          if (v > bv) { bv = v; bs = seq }
+                      }
+                  }
+                  rec(g, ps.indices.filter { ps[it] != null }, emptyList(), 0.0)
+                  return bs
+              }
+          }
+
+          /** Reads the board and the 3 tray pieces from a screenshot. */
+          class Vision(val b: Bitmap, val c: Cfg) {
+              val W = b.width; val H = b.height
+              private val px = IntArray(W * H).also { b.getPixels(it, 0, W, 0, 0, W, H) }
+              val bl = c.f("bl") * W; val bt = c.f("bt") * H; val cell = c.f("bs") * W / 8f
+              private val hsv = FloatArray(3)
+              fun on(x: Int, y: Int): Boolean {
+                  if (x < 0 || y < 0 || x >= W || y >= H) return false
+                  Color.colorToHSV(px[y * W + x], hsv)
+                  return hsv[1] > 0.4f && hsv[2] > 0.55f   // filled blocks are saturated + bright, empty cells are dark
+              }
+              fun board() = Array(8) { r -> IntArray(8) { k -> if (on((bl + (k + .5f) * cell).toInt(), (bt + (r + .5f) * cell).toInt())) 1 else 0 } }
+              fun pieces(): List<Shape?> {
+                  val ty = (c.f("ty") * H).toInt(); val th = (c.f("th") * H).toInt()
+                  val sw = (c.f("bs") * W / 3).toInt(); val pc = cell * c.f("ps")
+                  return (0 until 3).map { i ->
+                      val x0 = (bl + i * sw).toInt()
+                      var mnx = Int.MAX_VALUE; var mxx = -1; var mny = Int.MAX_VALUE; var mxy = -1
+                      for (y in ty until minOf(ty + th, H) step 3) for (x in x0 until x0 + sw step 3) if (on(x, y)) {
+                          if (x < mnx) mnx = x; if (x > mxx) mxx = x; if (y < mny) mny = y; if (y > mxy) mxy = y
+                      }
+                      if (mxx < 0) null else {
+                          val bw = mxx - mnx + 3; val bh = mxy - mny + 3
+                          val cols = (bw / pc).roundToInt().coerceIn(1, 5); val rows = (bh / pc).roundToInt().coerceIn(1, 5)
+                          val cw = bw / cols.toFloat(); val ch = bh / rows.toFloat()
+                          val cells = ArrayList<IntArray>()
+                          for (r in 0 until rows) for (k in 0 until cols)
+                              if (on((mnx + (k + .5f) * cw).toInt(), (mny + (r + .5f) * ch).toInt())) cells.add(intArrayOf(r, k))
+                          Shape(cells, cols, rows, mnx + bw / 2f, mny + bh / 2f)
+                      }
+                  }
+              }
+          }
+          EOF_3
+          mkdir -p BlastBot/app/src/main/java/com/nyx/blastbot
+          cat > BlastBot/app/src/main/java/com/nyx/blastbot/MainActivity.kt <<'EOF_4'
+          package com.nyx.blastbot
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.graphics.BitmapFactory
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.widget.*
+          import java.io.File
+
+          class MainActivity : Activity() {
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val cfg = Cfg(this)
+                  val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 64, 32, 32) }
+                  fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
+                  root.addView(TextView(this).apply {
+                      text = "BlastBot: vao Block Blast la tu choi.\n1) Bat dich vu Tro nang\n2) Chup thu de canh luoi, chinh thong so\n3) Mo Block Blast"
+                  })
+                  btn("Mo cai dat Tro nang") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  root.addView(Switch(this).apply {
+                      text = "Tu choi khi vao game"; isChecked = cfg.on; setOnCheckedChangeListener { _, v -> cfg.on = v }
+                  })
+                  val labels = mapOf("bl" to "le trai ban (x/rong man)", "bt" to "dinh ban (y/cao man)", "bs" to "do rong ban (/rong man)",
+                      "ty" to "dinh khay khoi (y/cao man)", "th" to "cao khay khoi", "ps" to "ti le o khoi trong khay so voi ban",
+                      "dy" to "lech tha theo Y (don vi o, vd -1 hoac 1.5)")
+                  val pk = EditText(this).apply { setText(cfg.pkg) }
+                  root.addView(TextView(this).apply { text = "package game" }); root.addView(pk)
+                  val ed = HashMap<String, EditText>()
+                  for (k in cfg.defaults.keys) {
+                      root.addView(TextView(this).apply { text = "$k: ${labels[k]}" })
+                      ed[k] = EditText(this).apply {
+                          setText(cfg.f(k).toString())
+                          inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or InputType.TYPE_NUMBER_FLAG_SIGNED
+                      }.also { root.addView(it) }
+                  }
+                  btn("Luu") {
+                      cfg.pkg = pk.text.toString().trim()
+                      ed.forEach { (k, e) -> e.text.toString().toFloatOrNull()?.let { cfg.set(k, it) } }
+                      Toast.makeText(this, "Da luu", Toast.LENGTH_SHORT).show()
+                  }
+                  btn("Chup thu (sau 6s, hay chuyen sang Block Blast)") {
+                      BotService.inst?.debugShot() ?: Toast.makeText(this, "Chua bat dich vu Tro nang", Toast.LENGTH_LONG).show()
+                  }
+                  val img = ImageView(this).apply { adjustViewBounds = true }
+                  btn("Xem anh debug") {
+                      BitmapFactory.decodeFile(File(getExternalFilesDir(null), "debug.png").path)?.let { img.setImageBitmap(it) }
+                  }
+                  root.addView(img)
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+          }
+          EOF_4
+          mkdir -p BlastBot/app/src/main/res/values
+          cat > BlastBot/app/src/main/res/values/strings.xml <<'EOF_5'
+          <resources><string name="desc">Tu dong choi Block Blast: chup man hinh va thuc hien thao tac keo tha.</string></resources>
+          EOF_5
+          mkdir -p BlastBot/app/src/main/res/xml
+          cat > BlastBot/app/src/main/res/xml/service_config.xml <<'EOF_6'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:canPerformGestures="true"
+              android:canTakeScreenshot="true"
+              android:notificationTimeout="100"
+              android:description="@string/desc"/>
+          EOF_6
+          mkdir -p BlastBot
+          cat > BlastBot/build.gradle.kts <<'EOF_7'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_7
+          mkdir -p BlastBot
+          cat > BlastBot/gradle.properties <<'EOF_8'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=false
+          EOF_8
+          mkdir -p BlastBot
+          cat > BlastBot/settings.gradle.kts <<'EOF_9'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "BlastBot"
+          include(":app")
+          EOF_9
+      - name: Build
+        run: gradle -p BlastBot assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BlastBot-apk
+          path: BlastBot/app/build/outputs/apk/debug/app-debug.apk
