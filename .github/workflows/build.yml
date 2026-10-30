@@ -62,7 +62,11 @@ jobs:
           import java.util.concurrent.Executors
 
           class BotService : AccessibilityService() {
-              companion object { var inst: BotService? = null }
+              companion object {
+                  var inst: BotService? = null
+                  // offsets tried (in cells) when a drop is rejected by the game
+                  val JIT = listOf(0 to -1, 0 to 1, 1 to 0, -1 to 0, 0 to -2, 0 to 2, 1 to -1, -1 to -1, 1 to 1, -1 to 1, 0 to -3, 0 to 3)
+              }
               private val h = Handler(Looper.getMainLooper())
               private val ex = Executors.newSingleThreadExecutor()
               private lateinit var cfg: Cfg
@@ -74,6 +78,10 @@ jobs:
               private var same = 0
               private var lastPkg: String? = null
               private var btn: Button? = null
+              private var pendBoard: Array<IntArray>? = null   // board before the last drag
+              private var pendR = 0; private var pendC = 0; private var pendN = 0
+              private var pendJx = 0; private var pendJy = 0
+              private var fails = 0
 
               override fun onServiceConnected() { inst = this; cfg = Cfg(this) }
               override fun onUnbind(i: Intent?): Boolean { inst = null; hideBtn(); return super.onUnbind(i) }
@@ -86,7 +94,7 @@ jobs:
                   playing = v; refreshBtn()
                   if (v && inGame) startLoop() else if (!v) { running = false; gen++ }
               }
-              private fun startLoop() { if (running) return; running = true; gen++; same = 0; last = ""; schedule(1500) }
+              private fun startLoop() { if (running) return; running = true; gen++; same = 0; last = ""; fails = 0; pendBoard = null; schedule(1500) }
               private fun autoStop(msg: String) {
                   playing = false; running = false; gen++
                   h.post { refreshBtn(); Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
@@ -148,16 +156,33 @@ jobs:
                   val v = Vision(bm, cfg); val g = v.board(); val ps = v.pieces()
                   if (debug) { drawDebug(bm, v, g, ps); return }
                   if (gn != gen || !running) return
+                  // Self-calibration: compare with the board before the last drag to see where the piece really landed.
+                  pendBoard?.let { pb ->
+                      var n = 0; var minR = 99; var minC = 99
+                      for (r in 0 until 8) for (c in 0 until 8) if (g[r][c] == 1 && pb[r][c] == 0) { n++; if (r < minR) minR = r; if (c < minC) minC = c }
+                      if (n == 0) fails++
+                      else {
+                          fails = 0
+                          if (n == pendN) {   // no line cleared, so the landing spot is unambiguous
+                              cfg.lx = cfg.lx + pendJx - (minC - pendC)
+                              cfg.ly = cfg.ly + pendJy - (minR - pendR)
+                          }
+                      }
+                      pendBoard = null
+                  }
                   if (ps.all { it == null }) { schedule(gap()); return }          // waiting for new pieces / loading
                   val sig = g.joinToString { it.joinToString("") } + ps.joinToString { "${it?.cells?.size}" }
                   same = if (sig == last) same + 1 else 0; last = sig
-                  if (same >= 8) { autoStop("Man hinh khong doi, da tu dung"); return }
+                  if (same >= 14) { autoStop("Man hinh khong doi, da tu dung"); return }
                   val seq = Solver.plan(g, ps)
+                  if (cfg.live) saveDebug(Overlay.render(bm, cfg, v, g, ps, seq, 0, "tu choi"))
                   if (seq == null) { schedule(gap()); return }
                   if (gn != gen || !running) return
                   val m = seq[0]; val s = ps[m.i]!!
-                  val x1 = v.bl + (m.c + s.w / 2f) * v.cell
-                  val y1 = v.bt + (m.r + s.h / 2f) * v.cell + cfg.f("dy") * v.cell
+                  val jit = if (fails > 0) JIT[(fails - 1) % JIT.size] else (0 to 0)
+                  pendBoard = g; pendR = m.r; pendC = m.c; pendN = s.cells.size; pendJx = jit.first; pendJy = jit.second
+                  val x1 = v.bl + (m.c + s.w / 2f + cfg.lx + jit.first) * v.cell
+                  val y1 = v.bt + (m.r + s.h / 2f + cfg.ly + cfg.f("dy") + jit.second) * v.cell
                   val path = Path().apply { moveTo(s.cx, s.cy); lineTo(x1, y1) }
                   val gd = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 400)).build()
                   h.post {
@@ -169,20 +194,13 @@ jobs:
               }
 
               private fun drawDebug(bm: Bitmap, v: Vision, g: Array<IntArray>, ps: List<Shape?>) {
-                  val c = Canvas(bm); val p = Paint().apply { strokeWidth = 4f }
-                  p.style = Paint.Style.STROKE; p.color = Color.CYAN
-                  c.drawRect(v.bl, v.bt, v.bl + v.cell * 8, v.bt + v.cell * 8, p)
-                  p.style = Paint.Style.FILL
-                  for (r in 0 until 8) for (k in 0 until 8) {
-                      p.color = if (g[r][k] == 1) Color.GREEN else Color.RED
-                      c.drawCircle(v.bl + (k + .5f) * v.cell, v.bt + (r + .5f) * v.cell, v.cell / 8, p)
-                  }
-                  p.color = Color.MAGENTA
-                  ps.forEach { s -> if (s != null) c.drawCircle(s.cx, s.cy, 16f, p) }
-                  p.style = Paint.Style.STROKE; p.color = Color.YELLOW
-                  c.drawRect(v.bl, cfg.f("ty") * v.H, v.bl + v.cell * 8, (cfg.f("ty") + cfg.f("th")) * v.H, p)
-                  File(getExternalFilesDir(null), "debug.png").outputStream().use { bm.compress(Bitmap.CompressFormat.PNG, 90, it) }
+                  val plan = if (ps.any { it != null }) Solver.plan(g, ps) else null
+                  saveDebug(Overlay.render(bm, cfg, v, g, ps, plan, 0, "chup thu"))
                   h.post { Toast.makeText(this, "Da luu anh debug. Game: ${cfg.pkg}. Khay: " + ps.joinToString { "${it?.w}x${it?.h}" }, Toast.LENGTH_LONG).show() }
+              }
+
+              private fun saveDebug(img: Bitmap) {
+                  try { File(getExternalFilesDir(null), "debug.jpg").outputStream().use { img.compress(Bitmap.CompressFormat.JPEG, 80, it) } } catch (e: Exception) {}
               }
           }
           EOF_2
@@ -192,6 +210,8 @@ jobs:
 
           import android.content.Context
           import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Paint
           import android.graphics.Color
           import kotlin.math.roundToInt
 
@@ -212,6 +232,16 @@ jobs:
               var sec: Int   // seconds between steps, 1..60
                   get() = p.getInt("sec", 2)
                   set(v) = p.edit().putInt("sec", v.coerceIn(1, 60)).apply()
+              // learned drop offsets (cells), measured from where pieces actually land
+              var lx: Float
+                  get() = p.getFloat("lx", 0f)
+                  set(v) = p.edit().putFloat("lx", v.coerceIn(-6f, 6f)).apply()
+              var ly: Float
+                  get() = p.getFloat("ly", 0f)
+                  set(v) = p.edit().putFloat("ly", v.coerceIn(-6f, 6f)).apply()
+              var live: Boolean   // save an annotated debug image on every capture
+                  get() = p.getBoolean("live", true)
+                  set(v) = p.edit().putBoolean("live", v).apply()
               var on: Boolean
                   get() = p.getBoolean("on", true)
                   set(v) = p.edit().putBoolean("on", v).apply()
@@ -225,7 +255,7 @@ jobs:
                   for (r in 0..N - s.h) for (c in 0..N - s.w) if (fits(g, s, r, c)) o.add(intArrayOf(r, c))
                   return o
               }
-              private fun apply(g: Array<IntArray>, s: Shape, r: Int, c: Int): Pair<Array<IntArray>, Int> {
+              fun place(g: Array<IntArray>, s: Shape, r: Int, c: Int): Pair<Array<IntArray>, Int> {
                   val n = Array(N) { g[it].clone() }
                   for (p in s.cells) n[r + p[0]][c + p[1]] = 1
                   val rows = (0 until N).filter { i -> n[i].all { it == 1 } }
@@ -258,7 +288,7 @@ jobs:
                       for (i in rem) {
                           val s = ps[i]!!
                           val cand = placements(g, s).map { (r, c) ->
-                              val a = apply(g, s, r, c); Triple(intArrayOf(r, c), a, eval(a.first) + a.second * 8)
+                              val a = place(g, s, r, c); Triple(intArrayOf(r, c), a, eval(a.first) + a.second * 8)
                           }.sortedByDescending { it.third }.take(8)
                           for (m in cand) {
                               any = true
@@ -309,11 +339,59 @@ jobs:
                           val cols = (bw / pc).roundToInt().coerceIn(1, 5); val rows = (bh / pc).roundToInt().coerceIn(1, 5)
                           val cw = bw / cols.toFloat(); val ch = bh / rows.toFloat()
                           val cells = ArrayList<IntArray>()
-                          for (r in 0 until rows) for (k in 0 until cols)
+                                                    for (r in 0 until rows) for (k in 0 until cols)
                               if (piece((mnx + (k + .5f) * cw).toInt(), (mny + (r + .5f) * ch).toInt())) cells.add(intArrayOf(r, k))
                           Shape(cells, cols, rows, mnx + bw / 2f, mny + bh / 2f)
                       }
                   }
+              }
+          }
+
+          /** Annotated screenshot: detected board/tray, the planned move, the finger path (with learned offsets). */
+          object Overlay {
+              fun render(src: Bitmap, cfg: Cfg, v: Vision, g: Array<IntArray>, ps: List<Shape?>, plan: List<Move>?, step: Int, note: String): Bitmap {
+                  val bm = src.copy(Bitmap.Config.ARGB_8888, true)
+                  val c = Canvas(bm); val cell = v.cell; val W = bm.width.toFloat()
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG); p.textSize = W / 24f
+                  p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = Color.CYAN
+                  c.drawRect(v.bl, v.bt, v.bl + cell * 8, v.bt + cell * 8, p)
+                  p.style = Paint.Style.FILL
+                  for (r in 0 until 8) for (k in 0 until 8) {
+                      p.color = if (g[r][k] == 1) Color.GREEN else Color.RED
+                      c.drawCircle(v.bl + (k + .5f) * cell, v.bt + (r + .5f) * cell, cell / 10, p)
+                  }
+                  p.color = Color.MAGENTA
+                  ps.forEach { s -> if (s != null) c.drawCircle(s.cx, s.cy, 12f, p) }
+                  fun cellsRect(s: Shape, r0: Int, c0: Int, color: Int) {
+                      p.style = Paint.Style.FILL; p.color = color
+                      for (q in s.cells) c.drawRect(v.bl + (c0 + q[1]) * cell, v.bt + (r0 + q[0]) * cell,
+                          v.bl + (c0 + q[1] + 1) * cell, v.bt + (r0 + q[0] + 1) * cell, p)
+                  }
+                  var line2 = ""
+                  if (plan != null) {
+                      plan.forEachIndexed { j, m ->      // placing order written on the tray pieces
+                          val s = ps[m.i]!!
+                          p.style = Paint.Style.FILL; p.color = Color.WHITE
+                          c.drawText("${j + 1}", s.cx + 16f, s.cy + 10f, p)
+                      }
+                      if (step in plan.indices) {
+                          for (i in 0 until step) { val m = plan[i]; cellsRect(ps[m.i]!!, m.r, m.c, Color.argb(110, 80, 140, 255)) }
+                          val m = plan[step]; val s = ps[m.i]!!
+                          cellsRect(s, m.r, m.c, Color.argb(160, 255, 215, 0))
+                          val x1 = v.bl + (m.c + s.w / 2f + cfg.lx) * cell
+                          val y1 = v.bt + (m.r + s.h / 2f + cfg.ly + cfg.f("dy")) * cell
+                          p.style = Paint.Style.STROKE; p.strokeWidth = 6f; p.color = Color.WHITE
+                          c.drawLine(s.cx, s.cy, x1, y1, p)
+                          p.style = Paint.Style.FILL; c.drawCircle(x1, y1, 18f, p)
+                          line2 = "Khoi ${step + 1}/${plan.size}: hang ${m.r + 1}, cot ${m.c + 1}"
+                      }
+                  }
+                  val lines = listOf(note, line2, "lx=%.1f ly=%.1f dy=%.1f".format(cfg.lx, cfg.ly, cfg.f("dy"))).filter { it.isNotEmpty() }
+                  p.style = Paint.Style.FILL; p.color = Color.argb(170, 0, 0, 0)
+                  c.drawRect(0f, 0f, W, p.textSize * (lines.size + .6f), p)
+                  p.color = Color.WHITE
+                  lines.forEachIndexed { i, t -> c.drawText(t, 12f, p.textSize * (i + 1.0f), p) }
+                  return bm
               }
           }
           EOF_3
@@ -323,14 +401,41 @@ jobs:
 
           import android.app.Activity
           import android.content.Intent
+          import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.provider.Settings
           import android.text.InputType
           import android.widget.*
           import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
 
           class MainActivity : Activity() {
+              private val h = Handler(Looper.getMainLooper())
+              private var lastMod = 0L
+              private lateinit var dbg: ImageView
+              private lateinit var dbgLab: TextView
+              private lateinit var resBox: LinearLayout
+
+              // The live debug image refreshes by itself whenever a new one is saved.
+              private val poll = object : Runnable {
+                  override fun run() { refreshDebug(); h.postDelayed(this, 1000) }
+              }
+              private fun refreshDebug() {
+                  val f = File(getExternalFilesDir(null), "debug.jpg")
+                  if (f.exists() && f.lastModified() != lastMod) {
+                      lastMod = f.lastModified()
+                      BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = 2 })?.let { dbg.setImageBitmap(it) }
+                      dbgLab.text = "Anh debug moi nhat (tu cap nhat): " + SimpleDateFormat("HH:mm:ss", Locale.US).format(Date(lastMod))
+                  }
+              }
+              override fun onResume() { super.onResume(); h.post(poll) }
+              override fun onPause() { super.onPause(); h.removeCallbacks(poll) }
+
               override fun onCreate(s: Bundle?) {
                   super.onCreate(s)
                   val cfg = Cfg(this)
@@ -343,7 +448,7 @@ jobs:
                   btn("BAT DAU") {
                       val svc = BotService.inst
                       if (svc == null) Toast.makeText(this, "Chua bat dich vu Tro nang", Toast.LENGTH_LONG).show()
-                                            else { svc.setPlaying(true); Toast.makeText(this, "Da bat dau. Mo Block Blast de bot tu choi.", Toast.LENGTH_LONG).show() }
+                      else { svc.setPlaying(true); Toast.makeText(this, "Da bat dau. Mo Block Blast de bot tu choi.", Toast.LENGTH_LONG).show() }
                   }
                   btn("DUNG") { BotService.inst?.setPlaying(false) }
 
@@ -356,6 +461,9 @@ jobs:
                           override fun onStartTrackingTouch(sb: SeekBar) {}
                           override fun onStopTrackingTouch(sb: SeekBar) {}
                       })
+                  })
+                  root.addView(Switch(this).apply {
+                      text = "Luu anh debug moi lan chup"; isChecked = cfg.live; setOnCheckedChangeListener { _, v -> cfg.live = v }
                   })
 
                   val labels = mapOf("bl" to "le trai ban (x/rong man)", "bt" to "dinh ban (y/cao man)", "bs" to "do rong ban (/rong man)",
@@ -373,18 +481,48 @@ jobs:
                   }
                   btn("Luu") {
                       cfg.pkg = pk.text.toString().trim()
+                      cfg.lx = 0f; cfg.ly = 0f   // forget learned drop offsets when settings change
                       ed.forEach { (k, e) -> e.text.toString().toFloatOrNull()?.let { cfg.set(k, it) } }
                       Toast.makeText(this, "Da luu", Toast.LENGTH_SHORT).show()
                   }
                   btn("Chup thu (sau 6s, hay chuyen sang Block Blast)") {
                       BotService.inst?.debugShot() ?: Toast.makeText(this, "Chua bat dich vu Tro nang", Toast.LENGTH_LONG).show()
                   }
-                  val img = ImageView(this).apply { adjustViewBounds = true }
-                  btn("Xem anh debug") {
-                      BitmapFactory.decodeFile(File(getExternalFilesDir(null), "debug.png").path)?.let { img.setImageBitmap(it) }
+
+                  // Analyse a screenshot from the gallery: one result image per piece left in the tray (0-3).
+                  btn("Them anh de phan tich") {
+                      startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).apply { type = "image/*" }, 7)
                   }
-                  root.addView(img)
+                  resBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(resBox)
+
+                  dbgLab = TextView(this).apply { text = "Chua co anh debug" }
+                  root.addView(dbgLab)
+                  dbg = ImageView(this).apply { adjustViewBounds = true }
+                  root.addView(dbg)
                   setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req != 7 || res != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  resBox.removeAllViews()
+                  fun say(t: String) = resBox.addView(TextView(this).apply { text = t })
+                  val bmp = try { contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) } } catch (e: Exception) { null }
+                  if (bmp == null) { say("Khong doc duoc anh"); return }
+                  val cfg = Cfg(this)
+                  val v = Vision(bmp, cfg); val g = v.board(); val ps = v.pieces()
+                  val n = ps.count { it != null }
+                  val plan = if (n > 0) Solver.plan(g, ps) else null
+                  val k = plan?.size ?: 0
+                  say("Thay $n khoi trong khay, co $k anh ket qua." + if (n > k) " (co khoi khong dat duoc)" else "")
+                  for (i in 0 until k) {
+                      val r = Overlay.render(bmp, cfg, v, g, ps, plan, i, "Anh ${i + 1}/$k")
+                      try { File(getExternalFilesDir(null), "analysis_${i + 1}.jpg").outputStream().use { r.compress(Bitmap.CompressFormat.JPEG, 85, it) } } catch (e: Exception) {}
+                      val small = Bitmap.createScaledBitmap(r, 540, (r.height * 540f / r.width).toInt(), true)
+                      resBox.addView(ImageView(this).apply { adjustViewBounds = true; setImageBitmap(small) })
+                  }
               }
           }
           EOF_4
