@@ -53,7 +53,10 @@ jobs:
           import android.os.Handler
           import android.os.Looper
           import android.view.Display
+          import android.view.Gravity
+          import android.view.WindowManager
           import android.view.accessibility.AccessibilityEvent
+          import android.widget.Button
           import android.widget.Toast
           import java.io.File
           import java.util.concurrent.Executors
@@ -63,21 +66,59 @@ jobs:
               private val h = Handler(Looper.getMainLooper())
               private val ex = Executors.newSingleThreadExecutor()
               private lateinit var cfg: Cfg
-              private var running = false
+              private var playing = false     // user pressed START
+              private var inGame = false      // Block Blast is in the foreground
+              private var running = false     // play loop is active
+              private var gen = 0             // invalidates old scheduled ticks
               private var last = ""
               private var same = 0
+              private var lastPkg: String? = null
+              private var btn: Button? = null
 
               override fun onServiceConnected() { inst = this; cfg = Cfg(this) }
-              override fun onUnbind(i: Intent?): Boolean { inst = null; return super.onUnbind(i) }
+              override fun onUnbind(i: Intent?): Boolean { inst = null; hideBtn(); return super.onUnbind(i) }
               override fun onInterrupt() {}
 
-              // Auto-start when Block Blast comes to the foreground, stop when you leave it.
+              private fun gap() = cfg.sec.coerceIn(1, 60) * 1000L
+
+              /** START / STOP. The bot only plays while START is on AND Block Blast is in the foreground. */
+              fun setPlaying(v: Boolean) {
+                  playing = v; refreshBtn()
+                  if (v && inGame) startLoop() else if (!v) { running = false; gen++ }
+              }
+              private fun startLoop() { if (running) return; running = true; gen++; same = 0; last = ""; schedule(1500) }
+              private fun autoStop(msg: String) {
+                  playing = false; running = false; gen++
+                  h.post { refreshBtn(); Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
+              }
+
               override fun onAccessibilityEvent(e: AccessibilityEvent) {
                   val p = e.packageName?.toString() ?: return
-                  if (p == cfg.pkg) {
-                      if (cfg.on && !running) { running = true; same = 0; last = ""; h.postDelayed({ tick() }, 2500) }
-                  } else if (p != "com.android.systemui" && !p.contains("inputmethod")) running = false
+                  val own = p == packageName
+                  if (own && e.className?.toString()?.endsWith("MainActivity") != true) return   // ignore our own overlay
+                  if (p == "com.android.systemui" || p.contains("inputmethod")) return
+                  if (!own) lastPkg = p
+                  if (p == cfg.pkg) { inGame = true; showBtn(); if (playing) startLoop() }
+                  else { inGame = false; running = false; gen++; hideBtn() }
               }
+
+              // Floating START/STOP button, shown only over the game (no extra permission needed).
+              private fun showBtn() {
+                  if (btn != null) return
+                  val b = Button(this).apply { textSize = 13f; setOnClickListener { setPlaying(!playing) } }
+                  val lp = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.END; x = 16; y = 230 }
+                  btn = b; refreshBtn()
+                  try { (getSystemService(WINDOW_SERVICE) as WindowManager).addView(b, lp) } catch (e: Exception) { btn = null }
+              }
+              private fun hideBtn() {
+                  btn?.let { try { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) } catch (e: Exception) {} }
+                  btn = null
+              }
+              private fun refreshBtn() { btn?.text = if (playing) "DUNG" else "BAT DAU" }
 
               private fun shot(ok: (Bitmap) -> Unit, fail: () -> Unit) {
                   takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
@@ -91,25 +132,29 @@ jobs:
                   })
               }
 
+              private fun schedule(ms: Long) { val gn = gen; h.postDelayed({ if (gn == gen && running) tick() }, ms) }
               private fun tick() {
                   if (!running) return
-                  shot({ work(it, false) }, { h.postDelayed({ tick() }, 1200) })
+                  val gn = gen
+                  shot({ work(it, false, gn) }, { schedule(gap()) })
               }
 
               fun debugShot() {
                   Toast.makeText(this, "Chuyen sang Block Blast, chup sau 6s", Toast.LENGTH_LONG).show()
-                  h.postDelayed({ shot({ work(it, true) }, {}) }, 6000)
+                  h.postDelayed({ lastPkg?.let { cfg.pkg = it }; shot({ work(it, true, gen) }, {}) }, 6000)
               }
 
-              private fun work(bm: Bitmap, debug: Boolean) {
+              private fun work(bm: Bitmap, debug: Boolean, gn: Int) {
                   val v = Vision(bm, cfg); val g = v.board(); val ps = v.pieces()
                   if (debug) { drawDebug(bm, v, g, ps); return }
-                  if (ps.all { it == null }) { h.postDelayed({ tick() }, 1000); return }  // waiting for new pieces
+                  if (gn != gen || !running) return
+                  if (ps.all { it == null }) { schedule(gap()); return }          // waiting for new pieces / loading
                   val sig = g.joinToString { it.joinToString("") } + ps.joinToString { "${it?.cells?.size}" }
                   same = if (sig == last) same + 1 else 0; last = sig
-                  if (same >= 3) { running = false; return }       // nothing changes: game over / ad / bad calibration
+                  if (same >= 8) { autoStop("Man hinh khong doi, da tu dung"); return }
                   val seq = Solver.plan(g, ps)
-                  if (seq == null) { running = false; return }
+                  if (seq == null) { schedule(gap()); return }
+                  if (gn != gen || !running) return
                   val m = seq[0]; val s = ps[m.i]!!
                   val x1 = v.bl + (m.c + s.w / 2f) * v.cell
                   val y1 = v.bt + (m.r + s.h / 2f) * v.cell + cfg.f("dy") * v.cell
@@ -117,8 +162,8 @@ jobs:
                   val gd = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 400)).build()
                   h.post {
                       dispatchGesture(gd, object : GestureResultCallback() {
-                          override fun onCompleted(d: GestureDescription?) { h.postDelayed({ tick() }, 1100) }
-                          override fun onCancelled(d: GestureDescription?) { h.postDelayed({ tick() }, 1100) }
+                          override fun onCompleted(d: GestureDescription?) { schedule(gap()) }
+                          override fun onCancelled(d: GestureDescription?) { schedule(gap()) }
                       }, null)
                   }
               }
@@ -137,7 +182,7 @@ jobs:
                   p.style = Paint.Style.STROKE; p.color = Color.YELLOW
                   c.drawRect(v.bl, cfg.f("ty") * v.H, v.bl + v.cell * 8, (cfg.f("ty") + cfg.f("th")) * v.H, p)
                   File(getExternalFilesDir(null), "debug.png").outputStream().use { bm.compress(Bitmap.CompressFormat.PNG, 90, it) }
-                  h.post { Toast.makeText(this, "Da luu anh debug. Mo BlastBot de xem. Khay: " + ps.joinToString { "${it?.w}x${it?.h}" }, Toast.LENGTH_LONG).show() }
+                  h.post { Toast.makeText(this, "Da luu anh debug. Game: ${cfg.pkg}. Khay: " + ps.joinToString { "${it?.w}x${it?.h}" }, Toast.LENGTH_LONG).show() }
               }
           }
           EOF_2
@@ -155,15 +200,18 @@ jobs:
 
           /** Settings, all screen ratios so it works across resolutions. */
           class Cfg(ctx: Context) {
-              private val p = ctx.getSharedPreferences("cfg", 0)
+              private val p = ctx.getSharedPreferences("cfg2", 0)
               // bl/bt: board left/top (fraction of W/H). bs: board size (fraction of W). ty/th: tray top/height (fraction of H).
               // ps: tray piece cell size relative to board cell. dy: extra drop offset in cells (finger lift).
-              val defaults = linkedMapOf("bl" to 0.045f, "bt" to 0.30f, "bs" to 0.91f, "ty" to 0.76f, "th" to 0.14f, "ps" to 0.62f, "dy" to 0f)
+              val defaults = linkedMapOf("bl" to 0.057f, "bt" to 0.242f, "bs" to 0.889f, "ty" to 0.69f, "th" to 0.17f, "ps" to 0.45f, "dy" to 0f)
               fun f(k: String) = p.getFloat(k, defaults[k]!!)
               fun set(k: String, v: Float) = p.edit().putFloat(k, v).apply()
               var pkg: String
                   get() = p.getString("pkg", "com.block.juggle")!!
                   set(v) = p.edit().putString("pkg", v).apply()
+              var sec: Int   // seconds between steps, 1..60
+                  get() = p.getInt("sec", 2)
+                  set(v) = p.edit().putInt("sec", v.coerceIn(1, 60)).apply()
               var on: Boolean
                   get() = p.getBoolean("on", true)
                   set(v) = p.edit().putBoolean("on", v).apply()
@@ -233,6 +281,14 @@ jobs:
               private val px = IntArray(W * H).also { b.getPixels(it, 0, W, 0, 0, W, H) }
               val bl = c.f("bl") * W; val bt = c.f("bt") * H; val cell = c.f("bs") * W / 8f
               private val hsv = FloatArray(3)
+              private val bgc: Int by lazy { px[((c.f("ty") + c.f("th") / 2) * H).toInt().coerceIn(0, H - 1) * W + 10] }
+              // tray pieces: differ clearly from the tray background colour
+              fun piece(x: Int, y: Int): Boolean {
+                  if (x < 0 || y < 0 || x >= W || y >= H) return false
+                  val p = px[y * W + x]
+                  val dr = Color.red(p) - Color.red(bgc); val dg = Color.green(p) - Color.green(bgc); val db = Color.blue(p) - Color.blue(bgc)
+                  return dr * dr + dg * dg + db * db > 3600
+              }
               fun on(x: Int, y: Int): Boolean {
                   if (x < 0 || y < 0 || x >= W || y >= H) return false
                   Color.colorToHSV(px[y * W + x], hsv)
@@ -245,7 +301,7 @@ jobs:
                   return (0 until 3).map { i ->
                       val x0 = (bl + i * sw).toInt()
                       var mnx = Int.MAX_VALUE; var mxx = -1; var mny = Int.MAX_VALUE; var mxy = -1
-                      for (y in ty until minOf(ty + th, H) step 3) for (x in x0 until x0 + sw step 3) if (on(x, y)) {
+                      for (y in ty until minOf(ty + th, H) step 3) for (x in x0 until x0 + sw step 3) if (piece(x, y)) {
                           if (x < mnx) mnx = x; if (x > mxx) mxx = x; if (y < mny) mny = y; if (y > mxy) mxy = y
                       }
                       if (mxx < 0) null else {
@@ -254,7 +310,7 @@ jobs:
                           val cw = bw / cols.toFloat(); val ch = bh / rows.toFloat()
                           val cells = ArrayList<IntArray>()
                           for (r in 0 until rows) for (k in 0 until cols)
-                              if (on((mnx + (k + .5f) * cw).toInt(), (mny + (r + .5f) * ch).toInt())) cells.add(intArrayOf(r, k))
+                              if (piece((mnx + (k + .5f) * cw).toInt(), (mny + (r + .5f) * ch).toInt())) cells.add(intArrayOf(r, k))
                           Shape(cells, cols, rows, mnx + bw / 2f, mny + bh / 2f)
                       }
                   }
@@ -281,12 +337,27 @@ jobs:
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 64, 32, 32) }
                   fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
                   root.addView(TextView(this).apply {
-                      text = "BlastBot: vao Block Blast la tu choi.\n1) Bat dich vu Tro nang\n2) Chup thu de canh luoi, chinh thong so\n3) Mo Block Blast"
+                      text = "BlastBot\n1) Bat Tro nang cho BlastBot\n2) Bam BAT DAU, roi mo Block Blast\n3) Tren man hinh game co nut BAT DAU / DUNG noi"
                   })
                   btn("Mo cai dat Tro nang") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-                  root.addView(Switch(this).apply {
-                      text = "Tu choi khi vao game"; isChecked = cfg.on; setOnCheckedChangeListener { _, v -> cfg.on = v }
+                  btn("BAT DAU") {
+                      val svc = BotService.inst
+                      if (svc == null) Toast.makeText(this, "Chua bat dich vu Tro nang", Toast.LENGTH_LONG).show()
+                                            else { svc.setPlaying(true); Toast.makeText(this, "Da bat dau. Mo Block Blast de bot tu choi.", Toast.LENGTH_LONG).show() }
+                  }
+                  btn("DUNG") { BotService.inst?.setPlaying(false) }
+
+                  val lab = TextView(this).apply { text = "Thoi gian moi buoc: ${cfg.sec} giay (1-60)" }
+                  root.addView(lab)
+                  root.addView(SeekBar(this).apply {
+                      max = 59; progress = cfg.sec - 1
+                      setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(sb: SeekBar, v: Int, user: Boolean) { cfg.sec = v + 1; lab.text = "Thoi gian moi buoc: ${v + 1} giay (1-60)" }
+                          override fun onStartTrackingTouch(sb: SeekBar) {}
+                          override fun onStopTrackingTouch(sb: SeekBar) {}
+                      })
                   })
+
                   val labels = mapOf("bl" to "le trai ban (x/rong man)", "bt" to "dinh ban (y/cao man)", "bs" to "do rong ban (/rong man)",
                       "ty" to "dinh khay khoi (y/cao man)", "th" to "cao khay khoi", "ps" to "ti le o khoi trong khay so voi ban",
                       "dy" to "lech tha theo Y (don vi o, vd -1 hoac 1.5)")
