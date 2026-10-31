@@ -28,12 +28,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(28, 36, 28, 28)
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
         }
-
         val title = TextView(this).apply {
             text = "BlastBot"
             textSize = 30f
@@ -41,10 +36,10 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
         }
         val subtitle = TextView(this).apply {
-            text = "Trợ lý Block Blast trên Android"
+            text = "Trợ lý Block Blast • bàn cờ 8×8"
             textSize = 16f
             gravity = Gravity.CENTER
-            setPadding(0, 12, 0, 28)
+            setPadding(0, 12, 0, 24)
         }
         status = TextView(this).apply {
             textSize = 16f
@@ -61,18 +56,17 @@ class MainActivity : Activity() {
             text = "Kiểm tra kết nối"
             setOnClickListener { refreshStatus() }
         }
-        val note = TextView(this).apply {
-            text = "Bản nền mới: kết nối Trợ năng và kiểm tra trạng thái dịch vụ. Chưa tự kéo quân cho đến khi bộ nhận diện và xác nhận nước đi được hoàn thiện."
+        val instructions = TextView(this).apply {
+            text = "Sau khi bật dịch vụ BlastBot trong Trợ năng, nút BOT sẽ nổi trên màn hình. Chạm nút để bật hoặc tắt chế độ. Bản này đã có mô hình tọa độ ô và mẫu khối A/B/C; nhận diện hình ảnh và tự kéo quân vẫn đang được phát triển."
             textSize = 14f
             setPadding(4, 24, 4, 0)
         }
-
         root.addView(title)
         root.addView(subtitle)
         root.addView(status, LinearLayout.LayoutParams(-1, -2))
         root.addView(enable, LinearLayout.LayoutParams(-1, -2))
         root.addView(refresh, LinearLayout.LayoutParams(-1, -2))
-        root.addView(note, LinearLayout.LayoutParams(-1, -2))
+        root.addView(instructions, LinearLayout.LayoutParams(-1, -2))
         setContentView(root)
     }
 
@@ -81,15 +75,9 @@ class MainActivity : Activity() {
             contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
         ).orEmpty()
-        val serviceName = "$packageName/.BlastAccessibilityService"
         val connected = enabled.split(':').any {
-            it.equals(serviceName, ignoreCase = true) ||
-                it.endsWith("BlastAccessibilityService", ignoreCase = true)
+            it.endsWith("BlastAccessibilityService", ignoreCase = true)
         }
-        status.text = if (connected) {
-            "Trợ năng: ĐÃ BẬT"
-        } else {
-            "Trợ năng: CHƯA BẬT"
-        }
+        status.text = if (connected) "Trợ năng: ĐÃ BẬT" else "Trợ năng: CHƯA BẬT"
     }
 }
