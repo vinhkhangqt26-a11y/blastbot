@@ -87,12 +87,13 @@ jobs:
               private var failTotal = 0
               private var schedGen = -1
               private var otherTicks = 0
+              private var noMoveNoted = false
               private var pendShape: Shape? = null
               private var pendIdx = 0
               private var games = 1
               private var overTaps = 0
 
-              override fun onServiceConnected() { inst = this; cfg = Cfg(this); Stats.load(this) }
+              override fun onServiceConnected() { inst = this; cfg = Cfg(this); Stats.load(this); Brain.load(this) }
               override fun onUnbind(i: Intent?): Boolean { inst = null; hideBtn(); return super.onUnbind(i) }
               override fun onInterrupt() {}
 
@@ -104,7 +105,7 @@ jobs:
                   playing = v; refreshBtn()
                   if (v && inGame) startLoop() else if (!v) { running = false; gen++; Stats.stopClock(); Stats.save(this) }
               }
-              private fun startLoop() { if (running) return; running = true; gen++; same = 0; last = ""; fails = 0; badTries = 0; overTaps = 0; otherTicks = 0; pendBoard = null; Stats.startClock(); schedule(1500) }
+              private fun startLoop() { if (running) return; running = true; gen++; same = 0; last = ""; fails = 0; badTries = 0; overTaps = 0; otherTicks = 0; noMoveNoted = false; pendBoard = null; Stats.startClock(); schedule(1500) }
               private fun autoStop(msg: String) {
                   playing = false; running = false; gen++; Stats.stopClock(); Stats.save(this)
                   h.post { refreshBtn(); Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
@@ -195,7 +196,7 @@ jobs:
                   if (!v.isGameScreen()) {
                       otherTicks++
                       if (cfg.live) saveDebug(Overlay.render(bm, cfg, v, g, ps0, null, 0, "KHONG giong man choi, dang cho"))
-                                            if (otherTicks >= 60) { autoStop("Khong thay man choi Block Blast, da dung"); return }
+                      if (otherTicks >= 60) { autoStop("Khong thay man choi Block Blast, da dung"); return }
                       schedule(gap()); return
                   }
                   otherTicks = 0
@@ -210,11 +211,18 @@ jobs:
                       else {
                           fails = 0
                           val sh = pendShape
-                          if (n == pendN) {       // no line cleared, so the landing spot is unambiguous
+                          // Trust the landing spot only when exactly the piece's own cells appeared (no noise, no line clear).
+                          val exact = sh != null && n == pendN && sh.cells.all { q ->
+                              val rr = minR + q[0]; val cc = minC + q[1]
+                              rr in 0..7 && cc in 0..7 && g[rr][cc] == 1 && pb[rr][cc] == 0
+                          }
+                          if (exact && sh != null) {
                               val er = minR - pendR; val ec = minC - pendC
-                              cfg.lx = cfg.lx + pendJx - ec
-                              cfg.ly = cfg.ly + pendJy - er
-                              Stats.onPlaced(sh?.cells?.size ?: n, 0, 0, pendIdx, minR, minC, er == 0 && ec == 0 && pendJx == 0 && pendJy == 0, true)
+                              if (cfg.learn && Math.abs(er) <= 3 && Math.abs(ec) <= 3) {
+                                  cfg.lx = cfg.lx + pendJx - ec
+                                  cfg.ly = cfg.ly + pendJy - er
+                              }
+                              Stats.onPlaced(sh.cells.size, 0, 0, pendIdx, minR, minC, er == 0 && ec == 0 && pendJx == 0 && pendJy == 0, true)
                           } else if (sh != null) {
                               val (lr, lc) = Solver.lines(pb, sh, pendR, pendC)
                               Stats.onPlaced(sh.cells.size, lr, lc, pendIdx, pendR, pendC, false, false)
@@ -234,7 +242,10 @@ jobs:
                   if (same >= 14) { autoStop("Man hinh khong doi, da tu dung"); return }
                   val seq = Solver.plan(g, ps, cfg.mode, cfg.goal)
                   if (cfg.live) saveDebug(Overlay.render(bm, cfg, v, g, ps, seq, 0, "tu choi | van ${Stats.games} | nuoc ${Stats.placed} | diem ${Stats.score}"))
-                  if (seq == null) { schedule(gap()); return }
+                  if (seq == null) {
+                      if (!noMoveNoted) { noMoveNoted = true; Stats.note("Het cho dat: khong khoi nao vua, sap het van") }
+                      schedule(gap()); return
+                  }
                   if (gn != gen || !running) return
                   val m = seq[0]; val s = ps[m.i]!!
                   val jit = if (fails > 0) JIT[(fails - 1) % JIT.size] else (0 to 0)
@@ -252,7 +263,7 @@ jobs:
               }
 
               private fun tapPlay(v: Vision) {
-                  pendBoard = null; same = 0; last = ""; fails = 0; Stats.newGame(); Stats.save(this)
+                  pendBoard = null; same = 0; last = ""; fails = 0; noMoveNoted = false; Stats.newGame(); Stats.save(this)
                   val path = Path().apply { moveTo(0.5f * v.W, 0.693f * v.H) }
                   val gd = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 50)).build()
                   h.post {
@@ -305,10 +316,10 @@ jobs:
               // learned drop offsets (cells), measured from where pieces actually land
               var lx: Float
                   get() = p.getFloat("lx", 0f)
-                  set(v) = p.edit().putFloat("lx", v.coerceIn(-6f, 6f)).apply()
+                  set(v) = p.edit().putFloat("lx", v.coerceIn(-3f, 3f)).apply()
               var ly: Float
                   get() = p.getFloat("ly", 0f)
-                  set(v) = p.edit().putFloat("ly", v.coerceIn(-6f, 6f)).apply()
+                  set(v) = p.edit().putFloat("ly", v.coerceIn(-3f, 3f)).apply()
               var live: Boolean   // save an annotated debug image on every capture
                   get() = p.getBoolean("live", true)
                   set(v) = p.edit().putBoolean("live", v).apply()
@@ -321,6 +332,9 @@ jobs:
               var goal: Int   // 0 survival, 1 high score
                   get() = p.getInt("goal", 0)
                   set(v) = p.edit().putInt("goal", v).apply()
+              var learn: Boolean   // learn the drop offset from where pieces really land
+                  get() = p.getBoolean("learn", true)
+                  set(v) = p.edit().putBoolean("learn", v).apply()
               var on: Boolean
                   get() = p.getBoolean("on", true)
                   set(v) = p.edit().putBoolean("on", v).apply()
@@ -348,8 +362,105 @@ jobs:
               }
           }
 
+          /** Tunable evaluation weights: tuned by human ratings and by self-play training. */
+          class Weights(var iso: Double = 1.0, var trans: Double = 1.0, var small: Double = 2.2, var fill: Double = 0.35, var mob: Double = 3.0, var rew: Double = 1.0) {
+              fun copy() = Weights(iso, trans, small, fill, mob, rew)
+              fun mutate(rnd: java.util.Random): Weights {
+                  fun m(x: Double) = (x * Math.exp(0.3 * rnd.nextGaussian())).coerceIn(0.1, 8.0)
+                  return Weights(m(iso), m(trans), m(small), m(fill), m(mob), m(rew))
+              }
+              /** Mode and goal adjust the learned base weights without changing them. */
+              fun forPlay(mode: Int, goal: Int, danger: Boolean): Weights {
+                  val w = copy()
+                  if (goal == 1) { w.mob *= 0.35; w.rew *= 1.4 } else w.rew *= 0.8
+                  if (mode > 0 && danger) { w.mob *= 1.5; w.rew = rew }   // dangerous board: stay alive first
+                  if (mode == 0) w.mob = 0.0
+                  return w
+              }
+          }
+
+          /** The AI's memory: current weights, saved to weights.json, adapted by ratings and training. */
+          object Brain {
+              @Volatile var w = Weights()
+              private var good = Weights()
+              var trained = 0
+              private var loaded = false
+
+              @Synchronized fun load(ctx: Context) {
+                  if (loaded) return
+                  loaded = true
+                  try {
+                      val f = java.io.File(ctx.filesDir, "weights.json")
+                      if (!f.exists()) return
+                      val j = org.json.JSONObject(f.readText())
+                      w = Weights(j.optDouble("iso", 1.0), j.optDouble("trans", 1.0), j.optDouble("small", 2.2),
+                          j.optDouble("fill", 0.35), j.optDouble("mob", 3.0), j.optDouble("rew", 1.0))
+                      good = w.copy(); trained = j.optInt("trained")
+                  } catch (e: Exception) {}
+              }
+              @Synchronized fun save(ctx: Context) {
+                  try {
+                      val j = org.json.JSONObject()
+                      j.put("iso", w.iso); j.put("trans", w.trans); j.put("small", w.small)
+                      j.put("fill", w.fill); j.put("mob", w.mob); j.put("rew", w.rew); j.put("trained", trained)
+                      java.io.File(ctx.filesDir, "weights.json").writeText(j.toString())
+                  } catch (e: Exception) {}
+              }
+              @Synchronized fun reset(ctx: Context) { w = Weights(); good = Weights(); trained = 0; save(ctx) }
+              /** Human rating 1-5 for the last game: keep what worked, explore around a bad strategy. */
+              @Synchronized fun feedback(rating: Int, ctx: Context) {
+                  if (rating >= 4) good = w.copy() else if (rating <= 2) w = good.mutate(java.util.Random())
+                  save(ctx)
+              }
+              fun text(): String = "Trong so AI: iso=%.2f trans=%.2f nho=%.2f lap=%.2f song=%.2f thuong=%.2f | da huan luyen $trained vong"
+                  .format(w.iso, w.trans, w.small, w.fill, w.mob, w.rew)
+          }
+
+          /** Self-play training: hill-climbing on the weights using simulated games with random pieces. */
+          object Trainer {
+              @Volatile var stop = false
+
+              private fun simulate(w: Weights, seed: Long, goal: Int): Double {
+                  val rnd = java.util.Random(seed)
+                  var g = Array(8) { IntArray(8) }
+                  var score = 0.0
+                  for (t in 0 until 80) {
+                      val ps: List<Shape?> = List(3) { Lib.shapes[rnd.nextInt(Lib.shapes.size)] }
+                      val seq = Solver.plan(g, ps, 1, goal, w, 8) ?: break
+                      for (m in seq) {
+                          val s = ps[m.i]!!
+                          val (nb, l) = Solver.place(g, s, m.r, m.c)
+                          g = nb; score += s.cells.size + 10.0 * l * l
+                      }
+                      if (seq.size < 3) break      // a piece could not be placed: game over
+                  }
+                  return score
+              }
+
+              fun run(ctx: Context, seconds: Int, goal: Int, report: (String) -> Unit) {
+                  stop = false
+                  val t0 = System.currentTimeMillis()
+                  var iter = 0; var improved = 0; var last = 0.0
+                  var base = Brain.w.copy()
+                  val rnd = java.util.Random()
+                  while (!stop && System.currentTimeMillis() - t0 < seconds * 1000L) {
+                      val cand = base.mutate(rnd)
+                      var fb = 0.0; var fc = 0.0
+                      for (k in 0 until 4) { val seed = iter * 100L + k; fb += simulate(base, seed, goal); fc += simulate(cand, seed, goal) }
+                      iter++
+                      if (fc > fb) { base = cand; improved++ }
+                      last = maxOf(fb, fc) / 4
+                      report("Huan luyen: vong $iter, cai thien $improved lan, diem TB ${last.toInt()}")
+                  }
+                  Brain.w = base; Brain.trained += iter; Brain.save(ctx)
+                  report("Xong: $iter vong, $improved lan cai thien, da luu. ${Brain.text()}")
+              }
+          }
+
           object Solver {
               private const val N = 8
+              private class Node(val board: Array<IntArray>, val acc: Double, val seq: List<Move>, val used: Int) { var rank = 0.0 }
+
               private fun fits(g: Array<IntArray>, s: Shape, r: Int, c: Int) = s.cells.all { g[r + it[0]][c + it[1]] == 0 }
               private fun placements(g: Array<IntArray>, s: Shape): List<IntArray> {
                   val o = ArrayList<IntArray>()
@@ -362,12 +473,17 @@ jobs:
                   val rows = (0 until N).filter { i -> n[i].all { it == 1 } }
                   val cols = (0 until N).filter { j -> (0 until N).all { n[it][j] == 1 } }
                   for (i in rows) n[i].fill(0)
-                                    for (j in cols) for (i in 0 until N) n[i][j] = 0
+                  for (j in cols) for (i in 0 until N) n[i][j] = 0
                   return n to (rows.size + cols.size)
               }
-              private var rewS = 1.0   // how much line clears are worth (set per plan from the goal)
-              private var mobW = 1.5   // how much staying alive is worth
-              private fun reward(l: Int) = rewS * (10.0 * l + 6.0 * l * (l - 1))   // multi-line clears are worth more than the sum
+              /** Rows and columns that a placement would complete (for statistics). */
+              fun lines(g: Array<IntArray>, s: Shape, r: Int, c: Int): Pair<Int, Int> {
+                  val n = Array(N) { g[it].clone() }
+                  for (p in s.cells) n[r + p[0]][c + p[1]] = 1
+                  return (0 until N).count { i -> n[i].all { it == 1 } } to (0 until N).count { j -> (0 until N).all { n[it][j] == 1 } }
+              }
+
+              private fun reward(l: Int, w: Weights) = w.rew * (10.0 * l + 6.0 * l * (l - 1))   // multi-line clears are worth more than the sum
               /** How many common shapes can still be placed: a direct measure of staying alive. */
               private fun mobility(g: Array<IntArray>): Int {
                   var n = 0
@@ -378,87 +494,116 @@ jobs:
                   }
                   return n
               }
-              private fun eval(g: Array<IntArray>): Double {
-                  var p = 0.0; var f = 0
+              private fun sig(b: Array<IntArray>): Long {
+                  var h = 0L
+                  for (r in 0 until N) for (c in 0 until N) if (b[r][c] == 1) h = h or (1L shl (r * N + c))
+                  return h
+              }
+
+              /** Board quality: isolated cells, ragged edges, tiny enclosed empty regions, and how full it is. */
+              private fun eval(g: Array<IntArray>, w: Weights): Double {
+                  var iso = 0.0; var trans = 0.0; var f = 0
                   val d = arrayOf(intArrayOf(1, 0), intArrayOf(-1, 0), intArrayOf(0, 1), intArrayOf(0, -1))
                   for (r in 0 until N) for (c in 0 until N) {
                       if (g[r][c] == 1) { f++; continue }
                       var nb = 0
                       for (q in d) { val a = r + q[0]; val b = c + q[1]; if (a < 0 || b < 0 || a >= N || b >= N || g[a][b] == 1) nb++ }
-                      p += if (nb == 4) 4 else if (nb == 3) 1 else 0
+                      iso += if (nb == 4) 4 else if (nb == 3) 1 else 0
                   }
                   for (i in 0 until N) {
                       var pr = 1; var pc = 1
-                      for (j in 0 until N) { val a = g[i][j]; val b = g[j][i]; if (a != pr) p += .5; if (b != pc) p += .5; pr = a; pc = b }
-                      if (pr != 1) p += .5; if (pc != 1) p += .5
+                      for (j in 0 until N) { val a = g[i][j]; val b = g[j][i]; if (a != pr) trans += .5; if (b != pc) trans += .5; pr = a; pc = b }
+                      if (pr != 1) trans += .5; if (pc != 1) trans += .5
                   }
-                  return -p - f * .35
-              }
-              private class Leaf(val v: Double, val seq: List<Move>, val board: Array<IntArray>)
-
-              /** Rows and columns that a placement would complete (for statistics). */
-              fun lines(g: Array<IntArray>, s: Shape, r: Int, c: Int): Pair<Int, Int> {
-                  val n = Array(N) { g[it].clone() }
-                  for (p in s.cells) n[r + p[0]][c + p[1]] = 1
-                  return (0 until N).count { i -> n[i].all { it == 1 } } to (0 until N).count { j -> (0 until N).all { n[it][j] == 1 } }
+                  // empty regions of 1-2 cells can hardly ever be filled again
+                  val seen = Array(N) { BooleanArray(N) }
+                  var small = 0
+                  for (r in 0 until N) for (c in 0 until N) {
+                      if (g[r][c] == 1 || seen[r][c]) continue
+                      var n = 0; val st = ArrayList<Int>(); st.add(r * N + c); seen[r][c] = true
+                      while (st.isNotEmpty()) {
+                          val v = st.removeAt(st.size - 1); n++
+                          val y = v / N; val x = v % N
+                          for (q in d) {
+                              val a = y + q[0]; val b = x + q[1]
+                              if (a in 0 until N && b in 0 until N && g[a][b] == 0 && !seen[a][b]) { seen[a][b] = true; st.add(a * N + b) }
+                          }
+                      }
+                      if (n <= 2) small++
+                  }
+                  return -(w.iso * iso + w.trans * trans + w.small * small) - w.fill * f
               }
 
               /** Monte Carlo: play 3 random pieces greedily from this board; low value if the board dies. */
-              private fun rollout(g: Array<IntArray>, rnd: java.util.Random): Double {
+              private fun rollout(g: Array<IntArray>, rnd: java.util.Random, w: Weights): Double {
                   var b = g; var total = 0.0
                   for (k in 0 until 3) {
                       val s = Lib.shapes[rnd.nextInt(Lib.shapes.size)]
                       var bestV = -1e18; var bestB: Array<IntArray>? = null; var bestL = 0
                       for (r in 0..N - s.h) for (c in 0..N - s.w) if (fits(b, s, r, c)) {
                           val (nb, l) = place(b, s, r, c)
-                          val v = eval(nb) + reward(l)
+                          val v = eval(nb, w) + reward(l, w)
                           if (v > bestV) { bestV = v; bestB = nb; bestL = l }
                       }
                       val nb2 = bestB ?: return total - 50.0
-                      b = nb2; total += reward(bestL)
+                      b = nb2; total += reward(bestL, w)
                   }
-                  return total + eval(b) * 0.2
+                  return total + eval(b, w) * 0.2
               }
 
               /**
+               * Level-wise beam search over every order of the tray pieces, merging identical boards.
                * mode: 0 = greedy, 1 = beam search, 2 = beam search + Monte Carlo.
                * goal: 0 = survival (keep the board open), 1 = high score (chase line clears).
                */
-              fun plan(g: Array<IntArray>, ps: List<Shape?>, mode: Int = 1, goal: Int = 0): List<Move>? {
-                  rewS = if (goal == 1) 1.4 else 0.8
-                  mobW = if (mode == 0) 0.0 else if (goal == 1) 1.0 else 3.0
-                  if (mode > 0 && g.sumOf { it.sum() } >= 36) { mobW = 4.0; rewS = 1.0 }   // dangerous board: switch to survival
-                  val beam = when (mode) { 0 -> 1; 2 -> 10; else -> 8 }
-                  val leaves = ArrayList<Leaf>()
-                  fun rec(g: Array<IntArray>, rem: List<Int>, seq: List<Move>, bonus: Double) {
-                      var any = false
-                      for (i in rem) {
-                          val s = ps[i]!!
-                          val cand = placements(g, s).map { (r, c) ->
-                              val a = place(g, s, r, c); Triple(intArrayOf(r, c), a, eval(a.first) + reward(a.second))
-                          }.sortedByDescending { it.third }.take(beam)
-                          for (m in cand) {
-                              any = true
-                              rec(m.second.first, rem - i, seq + Move(i, m.first[0], m.first[1]), bonus + reward(m.second.second))
+              fun plan(g: Array<IntArray>, ps: List<Shape?>, mode: Int = 1, goal: Int = 0, w0: Weights = Brain.w, widthOverride: Int = 0): List<Move>? {
+                  val w = w0.forPlay(mode, goal, g.sumOf { it.sum() } >= 36)
+                  val width = if (widthOverride > 0) widthOverride else when (mode) { 0 -> 1; 2 -> 40; else -> 24 }
+                  val ids = ps.indices.filter { ps[it] != null }
+                  if (ids.isEmpty()) return null
+                  var beam = listOf(Node(g, 0.0, emptyList(), 0))
+                  val done = ArrayList<Node>()
+                  for (level in ids.indices) {
+                      val cand = ArrayList<Node>()
+                      for (nd in beam) {
+                          var any = false
+                          for (i in ids) {
+                              if (((nd.used shr i) and 1) == 1) continue
+                              val s = ps[i]!!
+                              for (pl in placements(nd.board, s)) {
+                                  any = true
+                                  val (nb, l) = place(nd.board, s, pl[0], pl[1])
+                                  cand.add(Node(nb, nd.acc + reward(l, w), nd.seq + Move(i, pl[0], pl[1]), nd.used or (1 shl i)))
+                              }
                           }
+                          if (!any && nd.seq.isNotEmpty()) done.add(nd)
                       }
-                      if (!any && seq.isNotEmpty()) leaves.add(Leaf(bonus + eval(g) + mobW * mobility(g) - 60.0 * rem.size, seq, g))
+                      if (cand.isEmpty()) break
+                      for (nd in cand) nd.rank = nd.acc + eval(nd.board, w)
+                      cand.sortByDescending { it.rank }
+                      val seen = HashSet<Pair<Long, Int>>(); val next = ArrayList<Node>()
+                      for (nd in cand) {
+                          if (seen.add(sig(nd.board) to nd.used)) { next.add(nd); if (next.size >= width) break }
+                      }
+                      beam = next
                   }
-                  rec(g, ps.indices.filter { ps[it] != null }, emptyList(), 0.0)
-                  if (leaves.isEmpty()) return null
-                  leaves.sortByDescending { it.v }
+                  val pool = ArrayList<Node>(done)
+                  pool.addAll(beam.filter { it.seq.isNotEmpty() })
+                  if (pool.isEmpty()) return null
+                  for (nd in pool) nd.rank = nd.acc + eval(nd.board, w) + w.mob * mobility(nd.board) - 60.0 * (ids.size - nd.seq.size)
+                  pool.sortByDescending { it.rank }
                   if (mode == 2) {
                       val rnd = java.util.Random()
-                      var best = leaves[0]; var bv = -1e18
-                      for (lf in leaves.take(12)) {
+                      var best = pool[0]; var bv = -1e18
+                      for (nd in pool.take(12)) {
                           var sum = 0.0
-                          for (k in 0 until 10) sum += rollout(lf.board, rnd)
-                          val v = lf.v + 0.5 * sum / 10.0
-                          if (v > bv) { bv = v; best = lf }
+                          for (k in 0 until 10) sum += rollout(nd.board, rnd, w)
+                          val v = nd.rank + 0.5 * sum / 10.0
+                          if (v > bv) { bv = v; best = nd }
                       }
                       return best.seq
                   }
-                  return leaves[0].seq
+                  return pool[0].seq
               }
           }
 
@@ -533,7 +678,7 @@ jobs:
                   val c = Canvas(bm); val cell = v.cell; val W = bm.width.toFloat()
                   val p = Paint(Paint.ANTI_ALIAS_FLAG); p.textSize = W / 24f
                   p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = Color.CYAN
-                                    c.drawRect(v.bl, v.bt, v.bl + cell * 8, v.bt + cell * 8, p)
+                  c.drawRect(v.bl, v.bt, v.bl + cell * 8, v.bt + cell * 8, p)
                   p.style = Paint.Style.FILL
                   for (r in 0 until 8) for (k in 0 until 8) {
                       p.color = if (g[r][k] == 1) Color.GREEN else Color.RED
@@ -602,6 +747,7 @@ jobs:
                       j.put("best", best); j.put("placed", placed); j.put("attempts", attempts)
                       j.put("rows", rows); j.put("cols", cols); j.put("exact", exact)
                       j.put("samples", samples); j.put("completed", completed); j.put("playMs", playMs)
+                      val arr = org.json.JSONArray(); hist.forEach { arr.put(it) }; j.put("history", arr)
                       java.io.File(ctx.filesDir, "stats.json").writeText(j.toString())
                   } catch (e: Exception) {}
               }
@@ -617,6 +763,7 @@ jobs:
                   hist.add("Khoi $piece -> hang ${row + 1}, cot ${col + 1}" + if (r + c > 0) " (an $r hang, $c cot)" else "")
                   if (hist.size > 30) hist.removeAt(0)
               }
+              @Synchronized fun note(t: String) { hist.add(t); if (hist.size > 30) hist.removeAt(0) }
               @Synchronized fun history(): String = hist.takeLast(15).reversed().joinToString("\n")
               @Synchronized fun text(): String {
                   val t = playMs + if (clock != 0L) System.currentTimeMillis() - clock else 0L
@@ -654,6 +801,10 @@ jobs:
               private lateinit var dbgLab: TextView
               private lateinit var resBox: LinearLayout
               private lateinit var statsTv: TextView
+              private lateinit var offTv: TextView
+              private lateinit var brainTv: TextView
+              @Volatile private var trainingRunning = false
+              private lateinit var cfgRef: Cfg
               private lateinit var histTv: TextView
 
               // The live debug image refreshes by itself whenever a new one is saved.
@@ -661,6 +812,8 @@ jobs:
                   override fun run() {
                       refreshDebug()
                       statsTv.text = Stats.text()
+                      brainTv.text = Brain.text()
+                      offTv.text = "Do lech da hoc: lx=%.1f  ly=%.1f (don vi o)".format(cfgRef.lx, cfgRef.ly)
                       histTv.text = "Lich su nuoc di:\n" + Stats.history()
                       h.postDelayed(this, 1000)
                   }
@@ -679,7 +832,9 @@ jobs:
               override fun onCreate(s: Bundle?) {
                   super.onCreate(s)
                   val cfg = Cfg(this)
+                  cfgRef = cfg
                   Stats.load(this)
+                  Brain.load(this)
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 64, 32, 32) }
                   fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
                   root.addView(TextView(this).apply {
@@ -708,6 +863,34 @@ jobs:
                   }
                   spin("Che do AI", listOf("DE: tham lam", "THONG MINH: tim kiem nhieu buoc", "NANG CAO: tim kiem + Monte Carlo"), cfg.mode) { cfg.mode = it }
                   spin("Muc tieu", listOf("SINH TON: giu ban co thoang", "DIEM CAO: uu tien an nhieu hang"), cfg.goal) { cfg.goal = it }
+
+                  root.addView(Switch(this).apply {
+                      text = "Tu hoc do lech tha khoi"; isChecked = cfg.learn; setOnCheckedChangeListener { _, v -> cfg.learn = v }
+                  })
+                  offTv = TextView(this)
+                  root.addView(offTv)
+                  btn("Reset do lech da hoc") { cfg.lx = 0f; cfg.ly = 0f; Toast.makeText(this, "Da reset do lech ve 0", Toast.LENGTH_SHORT).show() }
+
+                  // AI memory: ratings and self-play training adjust the evaluation weights.
+                  brainTv = TextView(this)
+                  root.addView(brainTv)
+                  var rating = 3
+                  spin("Danh gia chien luoc van vua roi (4-5: giu, 1-2: thu huong khac)", listOf("1", "2", "3", "4", "5"), 2) { rating = it + 1 }
+                  btn("Gui danh gia (AI hoc)") { Brain.feedback(rating, this); Toast.makeText(this, "Da luu danh gia", Toast.LENGTH_SHORT).show() }
+                  val trainTv = TextView(this)
+                  root.addView(trainTv)
+                  btn("Huan luyen AI bang van mo phong (60 giay)") {
+                      if (!trainingRunning) {
+                          trainingRunning = true
+                          Thread {
+                              Trainer.run(this, 60, cfg.goal) { msg -> runOnUiThread { trainTv.text = msg } }
+                              trainingRunning = false
+                          }.start()
+                      }
+                  }
+                  btn("Dung huan luyen") { Trainer.stop = true }
+                  btn("Dua AI ve mac dinh") { Brain.reset(this); Toast.makeText(this, "Da dua AI ve mac dinh", Toast.LENGTH_SHORT).show() }
+
                   statsTv = TextView(this).apply { text = Stats.text() }
                   root.addView(statsTv)
                   histTv = TextView(this).apply { text = "Lich su nuoc di:" }
