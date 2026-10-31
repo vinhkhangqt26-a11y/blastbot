@@ -391,6 +391,7 @@ class App:
         self.piece_vars = []
         self.cells = []
         self.result = None
+        self.history = load_json(HISTORY_FILE, {"moves": []}).get("moves", [])
         self.root = tk.Tk()
         self.root.title("Block Blast AI Bot V8")
         self.root.geometry("1080x780")
@@ -504,7 +505,10 @@ class App:
             board, changed = self.vision.scan(self.vision.screenshot())
             self.board = board
             self.refresh()
-            self.status.set("Board scanned; verify the detected cells. Changed: " + str(changed))
+            pieces = self.parse_pieces()
+            game_over = Vision.game_over(board, pieces, self.engine)
+            self.status.set("Board scanned; changed: " + str(changed) +
+                            (" | No current piece fits (possible game over)." if game_over else ""))
             self.stats["games_seen"] = int(self.stats.get("games_seen", 0)) + int(changed)
         except Exception as exc:
             messagebox.showerror("Vision scan", str(exc))
@@ -558,6 +562,9 @@ class App:
             self.stats["moves_simulated"] = int(self.stats.get("moves_simulated", 0)) + 1
             self.stats["rows_cleared"] = int(self.stats.get("rows_cleared", 0)) + nr
             self.stats["columns_cleared"] = int(self.stats.get("columns_cleared", 0)) + nc
+            self.history.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": "simulator", "piece": move.piece_id, "row": move.row,
+                "col": move.col, "rows": nr, "columns": nc})
             self.result = None
             self.refresh()
             self.status.set("Move applied to simulator only.")
@@ -575,6 +582,9 @@ class App:
             move = result.moves[0]
             self.auto.drag(move.piece_id, move.row, move.col, self.size)
             self.stats["moves_dragged"] = int(self.stats.get("moves_dragged", 0)) + 1
+            self.history.append({"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "mode": "screen", "piece": move.piece_id, "row": move.row,
+                "col": move.col, "rows": move.rows, "columns": move.cols})
             self.status.set("Drag sent. Rescan the board and confirm before the next move.")
             if self.settings.get("auto_rescan_after_move", True):
                 self.root.after(int(float(self.settings.get("post_drop_wait", .65))*1000),
@@ -604,7 +614,7 @@ class App:
         save_json(SETTINGS_FILE, self.settings)
         save_json(STATS_FILE, self.stats)
         save_json(HISTORY_FILE, {"saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                 "statistics": self.stats})
+                                 "statistics": self.stats, "moves": self.history[-500:]})
         self.status.set("Settings and statistics saved.")
 
     def close(self):
