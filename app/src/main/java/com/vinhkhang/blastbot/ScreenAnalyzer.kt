@@ -60,28 +60,33 @@ object ScreenAnalyzer {
         val trayCell = cell * 0.46f
         val centers = floatArrayOf(w * 0.20f, w * 0.48f, w * 0.765f)
         for (index in centers.indices) {
-            val cells = ArrayList<Cell>()
-            val colorPoints = ArrayList<Pair<Float, Float>>()
-            // Scan a centered 5x5 tray grid to support common polyominoes.
-            for (rr in -2..2) for (cc in -2..2) {
-                val x = centers[index] + cc * trayCell
-                val y = h * 0.728f + rr * trayCell
-                if (x < 0 || y < 0 || x >= w || y >= h) continue
-                if (isBlockPixel(bitmap.getPixel(x.toInt(), y.toInt()))) {
-                    cells.add(Cell(rr + 2, cc + 2))
-                    colorPoints.add(x to y)
+            data class Candidate(val cells: List<Cell>, val points: List<Pair<Float, Float>>)
+            var best: Candidate? = null
+            // Even-sized pieces have half-cell offsets from their center; odd-sized pieces use whole cells.
+            for (phaseY in listOf(-0.5f, 0f)) for (phaseX in listOf(-0.5f, 0f)) {
+                val cells = ArrayList<Cell>()
+                val points = ArrayList<Pair<Float, Float>>()
+                for (rr in 0..4) for (cc in 0..4) {
+                    val x = centers[index] + (cc - 2 + phaseX) * trayCell
+                    val y = h * 0.728f + (rr - 2 + phaseY) * trayCell
+                    if (x < 0 || y < 0 || x >= w || y >= h) continue
+                    if (isBlockPixel(bitmap.getPixel(x.toInt(), y.toInt()))) {
+                        cells.add(Cell(rr, cc))
+                        points.add(x to y)
+                    }
+                }
+                if (cells.size !in 1..9 || !isConnected(cells)) continue
+                if (best == null || cells.size > best!!.cells.size) {
+                    best = Candidate(cells, points)
                 }
             }
-            if (cells.isEmpty()) continue
-
-            val minR = cells.minOf { it.row }
-            val minC = cells.minOf { it.col }
-            val normalized = cells.map { Cell(it.row - minR, it.col - minC) }
-            // A valid tray piece is connected and contains 1..9 cells.
-            if (normalized.size !in 1..9 || !isConnected(normalized)) continue
+            val candidate = best ?: continue
+            val minR = candidate.cells.minOf { it.row }
+            val minC = candidate.cells.minOf { it.col }
+            val normalized = candidate.cells.map { Cell(it.row - minR, it.col - minC) }
             val piece = Piece("P$index", normalized)
-            val sx = colorPoints.map { it.first }.average().toFloat()
-            val sy = colorPoints.map { it.second }.average().toFloat()
+            val sx = candidate.points.map { it.first }.average().toFloat()
+            val sy = candidate.points.map { it.second }.average().toFloat()
             tray.add(TrayPiece(index, piece, sx, sy))
         }
         return GameFrame(ScreenBoard(boardCells, left, top, cell), tray, false)
