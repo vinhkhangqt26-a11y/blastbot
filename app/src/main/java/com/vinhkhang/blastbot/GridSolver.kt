@@ -9,7 +9,22 @@ data class Piece(val id: String, val cells: List<Cell>) {
     val width: Int get() = (cells.maxOfOrNull { it.col } ?: -1) + 1
 }
 
-data class Placement(val piece: Piece, val row: Int, val col: Int, val score: Int)
+/** One planned move. pieceIndex refers to the piece's position in the input tray list. */
+data class PlannedMove(
+    val pieceIndex: Int,
+    val piece: Piece,
+    val row: Int,
+    val col: Int,
+    val linesCleared: Int
+)
+
+/** Complete best sequence for the currently visible tray. */
+data class TurnPlan(
+    val moves: List<PlannedMove>,
+    val piecesPlaced: Int,
+    val totalLinesCleared: Int,
+    val score: Long
+)
 
 object GridSolver {
     const val SIZE = 8
@@ -22,14 +37,21 @@ object GridSolver {
     )
 
     fun canPlace(board: Array<BooleanArray>, piece: Piece, row: Int, col: Int): Boolean {
-        if (board.size != SIZE || board.any { it.size != SIZE }) return false
-        if (piece.cells.isEmpty() || row < 0 || col < 0 ||
+        if (!validBoard(board) || piece.cells.isEmpty() || row < 0 || col < 0 ||
             row + piece.height > SIZE || col + piece.width > SIZE) return false
         return piece.cells.all { cell -> !board[row + cell.row][col + cell.col] }
     }
 
-    /** Places a piece and clears every completed row and column. */
-    fun place(board: Array<BooleanArray>, piece: Piece, row: Int, col: Int): Array<BooleanArray>? {
+    private fun validBoard(board: Array<BooleanArray>) =
+        board.size == SIZE && board.all { it.size == SIZE }
+
+    private data class Applied(
+        val board: Array<BooleanArray>,
+        val cleared: Int
+    )
+
+    /** Places a piece, then clears all completed rows and columns simultaneously. */
+    private fun apply(board: Array<BooleanArray>, piece: Piece, row: Int, col: Int): Applied? {
         if (!canPlace(board, piece, row, col)) return null
         val next = Array(SIZE) { r -> board[r].copyOf() }
         piece.cells.forEach { next[row + it.row][col + it.col] = true }
@@ -39,28 +61,68 @@ object GridSolver {
         for (r in 0 until SIZE) for (c in 0 until SIZE) {
             if (r in fullRows || c in fullCols) next[r][c] = false
         }
-        return next
+        return Applied(next, fullRows.size + fullCols.size)
     }
 
-    /** Fast exhaustive search over the small 8x8 placement space. */
-    fun bestPlacement(board: Array<BooleanArray>, pieces: List<Piece>): Placement? {
-        var best: Placement? = null
-        for (piece in pieces) {
-            if (piece.cells.isEmpty() || piece.height > SIZE || piece.width > SIZE) continue
-            for (r in 0..(SIZE - piece.height)) {
-                for (c in 0..(SIZE - piece.width)) {
-                    if (!canPlace(board, piece, r, c)) continue
-                    val placed = Array(SIZE) { row -> board[row].copyOf() }
-                    piece.cells.forEach { placed[r + it.row][c + it.col] = true }
-                    val rows = (0 until SIZE).count { row -> placed[row].all { it } }
-                    val cols = (0 until SIZE).count { col -> (0 until SIZE).all { row -> placed[row][col] } }
-                    val cleared = rows + cols
-                    val remaining = place(board, piece, r, c)!!.sumOf { line -> line.count { it } }
-                    val score = cleared * 100 - remaining
-                    if (best == null || score > best.score) best = Placement(piece, r, c, score)
+    /** Public board transition helper, useful for previews and tests. */
+    fun place(board: Array<BooleanArray>, piece: Piece, row: Int, col: Int): Array<BooleanArray>? =
+        apply(board, piece, row, col)?.board
+
+    /**
+     * Looks ahead through every order and legal position for the current tray (normally 3 pieces).
+     * It first maximizes how many pieces can be placed, then line clears, then leaves a board
+     * with fewer occupied cells and fewer isolated one-cell gaps.
+     */
+    fun planTurn(board: Array<BooleanArray>, pieces: List<Piece>): TurnPlan? {
+        if (!validBoard(board) || pieces.isEmpty()) return null
+
+        var best: TurnPlan? = null
+        val used = BooleanArray(pieces.size)
+        val path = ArrayList<PlannedMove>(pieces.size)
+
+        fun boardQuality(state: Array<BooleanArray>): Long {
+            val occupied = state.sumOf { row -> row.count { it } }
+            var isolatedGaps = 0
+            for (r in 0 until SIZE) for (c in 0 until SIZE) {
+                if (state[r][c]) continue
+                val horizontalTrap = c in 1..(SIZE - 2) && state[r][c - 1] && state[r][c + 1]
+                val verticalTrap = r in 1..(SIZE - 2) && state[r - 1][c] && state[r + 1][c]
+                if (horizontalTrap || verticalTrap) isolatedGaps++
+            }
+            return occupied.toLong() * 10L + isolatedGaps.toLong() * 35L
+        }
+
+        fun visit(state: Array<BooleanArray>, clearedSoFar: Int) {
+            val candidateScore = path.size.toLong() * 1_000_000L +
+                clearedSoFar.toLong() * 10_000L - boardQuality(state)
+            val candidate = TurnPlan(path.toList(), path.size, clearedSoFar, candidateScore)
+            if (best == null || candidate.score > best!!.score) best = candidate
+
+            if (path.size == pieces.size) return
+
+            for (index in pieces.indices) {
+                if (used[index]) continue
+                val piece = pieces[index]
+                if (piece.cells.isEmpty() || piece.height > SIZE || piece.width > SIZE) continue
+
+                for (r in 0..(SIZE - piece.height)) {
+                    for (c in 0..(SIZE - piece.width)) {
+                        val result = apply(state, piece, r, c) ?: continue
+                        used[index] = true
+                        path.add(PlannedMove(index, piece, r, c, result.cleared))
+                        visit(result.board, clearedSoFar + result.cleared)
+                        path.removeAt(path.lastIndex)
+                        used[index] = false
+                    }
                 }
             }
         }
+
+        visit(Array(SIZE) { r -> board[r].copyOf() }, 0)
         return best
     }
+
+    /** Compatibility helper: returns the first move from the full-tray look-ahead plan. */
+    fun bestPlacement(board: Array<BooleanArray>, pieces: List<Piece>): PlannedMove? =
+        planTurn(board, pieces)?.moves?.firstOrNull()
 }
