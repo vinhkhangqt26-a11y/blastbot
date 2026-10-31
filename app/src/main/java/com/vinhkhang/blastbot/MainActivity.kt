@@ -57,7 +57,7 @@ class MainActivity : Activity() {
             setOnClickListener { refreshStatus() }
         }
         val instructions = TextView(this).apply {
-            text = "Sau khi bật dịch vụ BlastBot trong Trợ năng, nút BOT sẽ nổi trên màn hình. Chạm nút để bật hoặc tắt chế độ. Bản này đã có mô hình tọa độ ô và mẫu khối A/B/C; nhận diện hình ảnh và tự kéo quân vẫn đang được phát triển."
+            text = "Cách dùng: bật dịch vụ BlastBot trong Trợ năng, mở Block Blast rồi chạm nút nổi BOT. Bot sẽ đọc bàn cờ và 3 khối, tính nước đi nhìn trước, kéo từng khối và xác nhận bàn cờ đã đổi ổn định trước khi đi tiếp. Nếu không nhận diện chắc chắn hoặc không xác nhận được quân đã đặt, bot sẽ tự dừng. Cần Android 11 trở lên."
             textSize = 14f
             setPadding(4, 24, 4, 0)
         }
