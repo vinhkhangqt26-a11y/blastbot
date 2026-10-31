@@ -82,38 +82,55 @@ jobs:
               private var pendR = 0; private var pendC = 0; private var pendN = 0
               private var pendJx = 0; private var pendJy = 0
               private var fails = 0
+              private var badTries = 0
+              private var moves = 0
+              private var failTotal = 0
+              private var schedGen = -1
+              private var otherTicks = 0
+              private var pendShape: Shape? = null
+              private var pendIdx = 0
+              private var games = 1
+              private var overTaps = 0
 
-              override fun onServiceConnected() { inst = this; cfg = Cfg(this) }
+              override fun onServiceConnected() { inst = this; cfg = Cfg(this); Stats.load(this) }
               override fun onUnbind(i: Intent?): Boolean { inst = null; hideBtn(); return super.onUnbind(i) }
               override fun onInterrupt() {}
 
               private fun gap() = cfg.sec.coerceIn(1, 60) * 1000L
 
               /** START / STOP. The bot only plays while START is on AND Block Blast is in the foreground. */
-              fun setPlaying(v: Boolean) {
+              fun setPlaying(v: Boolean, fromOverlay: Boolean = false) {
+                  if (fromOverlay) inGame = true       // the floating button only exists (and can only be tapped) over the game
                   playing = v; refreshBtn()
-                  if (v && inGame) startLoop() else if (!v) { running = false; gen++ }
+                  if (v && inGame) startLoop() else if (!v) { running = false; gen++; Stats.stopClock(); Stats.save(this) }
               }
-              private fun startLoop() { if (running) return; running = true; gen++; same = 0; last = ""; fails = 0; pendBoard = null; schedule(1500) }
+              private fun startLoop() { if (running) return; running = true; gen++; same = 0; last = ""; fails = 0; badTries = 0; overTaps = 0; otherTicks = 0; pendBoard = null; Stats.startClock(); schedule(1500) }
               private fun autoStop(msg: String) {
-                  playing = false; running = false; gen++
+                  playing = false; running = false; gen++; Stats.stopClock(); Stats.save(this)
                   h.post { refreshBtn(); Toast.makeText(this, msg, Toast.LENGTH_LONG).show() }
               }
 
               override fun onAccessibilityEvent(e: AccessibilityEvent) {
                   val p = e.packageName?.toString() ?: return
+                  val cls = e.className?.toString() ?: ""
                   val own = p == packageName
-                  if (own && e.className?.toString()?.endsWith("MainActivity") != true) return   // ignore our own overlay
+                  if (own && !cls.endsWith("MainActivity")) return   // ignore our own overlay
                   if (p == "com.android.systemui" || p.contains("inputmethod")) return
+                  if (p == cfg.pkg) { inGame = true; showBtn(); if (playing) startLoop(); return }
+                  // Bubbles, dialogs and recorder overlays are not a real app switch: only a real screen (Activity/Launcher) counts.
+                  if (!cls.contains("Activity") && !cls.contains("Launcher")) return
                   if (!own) lastPkg = p
-                  if (p == cfg.pkg) { inGame = true; showBtn(); if (playing) startLoop() }
-                  else { inGame = false; running = false; gen++; hideBtn() }
+                  inGame = false; running = false; gen++; Stats.stopClock(); hideBtn()
               }
 
               // Floating START/STOP button, shown only over the game (no extra permission needed).
               private fun showBtn() {
                   if (btn != null) return
-                  val b = Button(this).apply { textSize = 13f; setOnClickListener { setPlaying(!playing) } }
+                  val b = Button(this).apply { textSize = 13f; setOnClickListener {
+                          val nv = !playing
+                          setPlaying(nv, true)
+                          Toast.makeText(this@BotService, if (nv) "Tiep tuc choi" else "Tam dung", Toast.LENGTH_SHORT).show()
+                      } }
                   val lp = WindowManager.LayoutParams(
                       WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
                       WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
@@ -126,7 +143,7 @@ jobs:
                   btn?.let { try { (getSystemService(WINDOW_SERVICE) as WindowManager).removeView(it) } catch (e: Exception) {} }
                   btn = null
               }
-              private fun refreshBtn() { btn?.text = if (playing) "DUNG" else "BAT DAU" }
+              private fun refreshBtn() { btn?.text = if (playing) "TAM DUNG" else if (Stats.attempts == 0) "BAT DAU" else "TIEP TUC" }
 
               private fun shot(ok: (Bitmap) -> Unit, fail: () -> Unit) {
                   takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
@@ -140,7 +157,13 @@ jobs:
                   })
               }
 
-              private fun schedule(ms: Long) { val gn = gen; h.postDelayed({ if (gn == gen && running) tick() }, ms) }
+              // At most one pending tick per run, so a recovered error can never start a second loop.
+              private fun schedule(ms: Long) {
+                  val gn = gen
+                  if (schedGen == gn) return
+                  schedGen = gn
+                  h.postDelayed({ if (schedGen == gn) schedGen = -1; if (gn == gen && running) tick() }, ms)
+              }
               private fun tick() {
                   if (!running) return
                   val gn = gen
@@ -153,38 +176,73 @@ jobs:
               }
 
               private fun work(bm: Bitmap, debug: Boolean, gn: Int) {
-                  val v = Vision(bm, cfg); val g = v.board(); val ps = v.pieces()
-                  if (debug) { drawDebug(bm, v, g, ps); return }
+                  try { workInner(bm, debug, gn) } catch (t: Throwable) { if (!debug) schedule(gap()) }   // never let the loop die silently
+              }
+
+              private fun workInner(bm: Bitmap, debug: Boolean, gn: Int) {
+                  val v = Vision(bm, cfg); val g = v.board(); val ps0 = v.pieces()
+                  if (debug) { drawDebug(bm, v, g, ps0); return }
                   if (gn != gen || !running) return
+                  // Game over: tap the gold play button to start the next game by itself.
+                  if (v.isGameOver()) {
+                      if (!cfg.replay || overTaps >= 5) { autoStop("Het van, da dung"); return }
+                      overTaps++
+                      tapPlay(v)
+                      return
+                  }
+                  overTaps = 0
+                  // Only plan and drag when the screenshot really looks like the board we know (loading, ads, menus are skipped).
+                  if (!v.isGameScreen()) {
+                      otherTicks++
+                      if (cfg.live) saveDebug(Overlay.render(bm, cfg, v, g, ps0, null, 0, "KHONG giong man choi, dang cho"))
+                                            if (otherTicks >= 60) { autoStop("Khong thay man choi Block Blast, da dung"); return }
+                      schedule(gap()); return
+                  }
+                  otherTicks = 0
                   // Self-calibration: compare with the board before the last drag to see where the piece really landed.
                   pendBoard?.let { pb ->
-                      var n = 0; var minR = 99; var minC = 99
-                      for (r in 0 until 8) for (c in 0 until 8) if (g[r][c] == 1 && pb[r][c] == 0) { n++; if (r < minR) minR = r; if (c < minC) minC = c }
-                      if (n == 0) fails++
+                      var n = 0; var minR = 99; var minC = 99; var changed = false
+                      for (r in 0 until 8) for (c in 0 until 8) {
+                          if (g[r][c] != pb[r][c]) changed = true
+                          if (g[r][c] == 1 && pb[r][c] == 0) { n++; if (r < minR) minR = r; if (c < minC) minC = c }
+                      }
+                      if (!changed) fails++       // the game rejected the drop
                       else {
                           fails = 0
-                          if (n == pendN) {   // no line cleared, so the landing spot is unambiguous
-                              cfg.lx = cfg.lx + pendJx - (minC - pendC)
-                              cfg.ly = cfg.ly + pendJy - (minR - pendR)
+                          val sh = pendShape
+                          if (n == pendN) {       // no line cleared, so the landing spot is unambiguous
+                              val er = minR - pendR; val ec = minC - pendC
+                              cfg.lx = cfg.lx + pendJx - ec
+                              cfg.ly = cfg.ly + pendJy - er
+                              Stats.onPlaced(sh?.cells?.size ?: n, 0, 0, pendIdx, minR, minC, er == 0 && ec == 0 && pendJx == 0 && pendJy == 0, true)
+                          } else if (sh != null) {
+                              val (lr, lc) = Solver.lines(pb, sh, pendR, pendC)
+                              Stats.onPlaced(sh.cells.size, lr, lc, pendIdx, pendR, pendC, false, false)
                           }
+                          if (Stats.placed % 10 == 0) Stats.save(this)
                       }
                       pendBoard = null
                   }
+                  // A piece that is not one connected blob means the camera caught an animation: look again shortly.
+                  val bad = ps0.count { it != null && !Lib.connected(it) }
+                  if (bad > 0 && badTries < 3) { badTries++; schedule(800); return }
+                  if (bad == 0) badTries = 0
+                  val ps = if (bad > 0) ps0.map { if (it != null && !Lib.connected(it)) null else it } else ps0
                   if (ps.all { it == null }) { schedule(gap()); return }          // waiting for new pieces / loading
                   val sig = g.joinToString { it.joinToString("") } + ps.joinToString { "${it?.cells?.size}" }
                   same = if (sig == last) same + 1 else 0; last = sig
                   if (same >= 14) { autoStop("Man hinh khong doi, da tu dung"); return }
-                  val seq = Solver.plan(g, ps)
-                  if (cfg.live) saveDebug(Overlay.render(bm, cfg, v, g, ps, seq, 0, "tu choi"))
+                  val seq = Solver.plan(g, ps, cfg.mode, cfg.goal)
+                  if (cfg.live) saveDebug(Overlay.render(bm, cfg, v, g, ps, seq, 0, "tu choi | van ${Stats.games} | nuoc ${Stats.placed} | diem ${Stats.score}"))
                   if (seq == null) { schedule(gap()); return }
                   if (gn != gen || !running) return
                   val m = seq[0]; val s = ps[m.i]!!
                   val jit = if (fails > 0) JIT[(fails - 1) % JIT.size] else (0 to 0)
-                  pendBoard = g; pendR = m.r; pendC = m.c; pendN = s.cells.size; pendJx = jit.first; pendJy = jit.second
+                  pendBoard = g; pendR = m.r; pendC = m.c; pendN = s.cells.size; pendJx = jit.first; pendJy = jit.second; pendShape = s; pendIdx = m.i + 1; Stats.attempts++
                   val x1 = v.bl + (m.c + s.w / 2f + cfg.lx + jit.first) * v.cell
                   val y1 = v.bt + (m.r + s.h / 2f + cfg.ly + cfg.f("dy") + jit.second) * v.cell
                   val path = Path().apply { moveTo(s.cx, s.cy); lineTo(x1, y1) }
-                  val gd = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 400)).build()
+                  val gd = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, (cfg.f("dur") * 1000).toLong().coerceIn(120L, 1500L))).build()
                   h.post {
                       dispatchGesture(gd, object : GestureResultCallback() {
                           override fun onCompleted(d: GestureDescription?) { schedule(gap()) }
@@ -193,9 +251,21 @@ jobs:
                   }
               }
 
+              private fun tapPlay(v: Vision) {
+                  pendBoard = null; same = 0; last = ""; fails = 0; Stats.newGame(); Stats.save(this)
+                  val path = Path().apply { moveTo(0.5f * v.W, 0.693f * v.H) }
+                  val gd = GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(path, 0, 50)).build()
+                  h.post {
+                      dispatchGesture(gd, object : GestureResultCallback() {
+                          override fun onCompleted(d: GestureDescription?) { schedule(3000) }
+                          override fun onCancelled(d: GestureDescription?) { schedule(3000) }
+                      }, null)
+                  }
+              }
+
               private fun drawDebug(bm: Bitmap, v: Vision, g: Array<IntArray>, ps: List<Shape?>) {
-                  val plan = if (ps.any { it != null }) Solver.plan(g, ps) else null
-                  saveDebug(Overlay.render(bm, cfg, v, g, ps, plan, 0, "chup thu"))
+                  val plan = if (ps.any { it != null }) Solver.plan(g, ps, cfg.mode, cfg.goal) else null
+                  saveDebug(Overlay.render(bm, cfg, v, g, ps, plan, 0, "chup thu | " + (if (v.isGameOver()) "man THUA" else if (v.isGameScreen()) "man CHOI" else "man KHAC")))
                   h.post { Toast.makeText(this, "Da luu anh debug. Game: ${cfg.pkg}. Khay: " + ps.joinToString { "${it?.w}x${it?.h}" }, Toast.LENGTH_LONG).show() }
               }
 
@@ -223,7 +293,7 @@ jobs:
               private val p = ctx.getSharedPreferences("cfg2", 0)
               // bl/bt: board left/top (fraction of W/H). bs: board size (fraction of W). ty/th: tray top/height (fraction of H).
               // ps: tray piece cell size relative to board cell. dy: extra drop offset in cells (finger lift).
-              val defaults = linkedMapOf("bl" to 0.057f, "bt" to 0.242f, "bs" to 0.889f, "ty" to 0.69f, "th" to 0.17f, "ps" to 0.45f, "dy" to 0f)
+              val defaults = linkedMapOf("bl" to 0.057f, "bt" to 0.242f, "bs" to 0.889f, "ty" to 0.69f, "th" to 0.17f, "ps" to 0.45f, "dy" to 0f, "dur" to 0.4f)
               fun f(k: String) = p.getFloat(k, defaults[k]!!)
               fun set(k: String, v: Float) = p.edit().putFloat(k, v).apply()
               var pkg: String
@@ -242,9 +312,40 @@ jobs:
               var live: Boolean   // save an annotated debug image on every capture
                   get() = p.getBoolean("live", true)
                   set(v) = p.edit().putBoolean("live", v).apply()
+              var replay: Boolean   // tap "play again" on the game-over screen
+                  get() = p.getBoolean("replay", true)
+                  set(v) = p.edit().putBoolean("replay", v).apply()
+              var mode: Int   // 0 easy (greedy), 1 smart (beam), 2 advanced (beam + Monte Carlo)
+                  get() = p.getInt("mode", 1)
+                  set(v) = p.edit().putInt("mode", v).apply()
+              var goal: Int   // 0 survival, 1 high score
+                  get() = p.getInt("goal", 0)
+                  set(v) = p.edit().putInt("goal", v).apply()
               var on: Boolean
                   get() = p.getBoolean("on", true)
                   set(v) = p.edit().putBoolean("on", v).apply()
+          }
+
+          /** Common piece shapes: used to judge how "survivable" a board is, and to sanity-check what the camera saw. */
+          object Lib {
+              private const val SRC = "X,XX,X/X,XXX,X/X/X,XXXX,X/X/X/X,XXXXX,X/X/X/X/X,XX/XX,XXX/XXX/XXX,XXX/XXX,XX/XX/XX,X./XX,XX/X.,.X/XX,XX/.X,X../X../XXX,XXX/X../X..,XXX/..X/..X,..X/..X/XXX,.XX/XX.,XX./.XX,X./XX/.X,.X/XX/X.,XXX/.X.,.X./XXX,X./XX/X.,.X/XX/.X"
+              val shapes: List<Shape> = SRC.split(",").map { s ->
+                  val rows = s.split("/"); val cells = ArrayList<IntArray>()
+                  rows.forEachIndexed { y, r -> r.forEachIndexed { x, ch -> if (ch == 'X') cells.add(intArrayOf(y, x)) } }
+                  Shape(cells, rows[0].length, rows.size)
+              }
+              /** Real pieces are always one connected blob; a disconnected read means the camera caught an animation. */
+              fun connected(s: Shape): Boolean {
+                  if (s.cells.isEmpty()) return false
+                  val set = s.cells.map { it[0] * 10 + it[1] }.toHashSet()
+                  val seen = HashSet<Int>(); val st = ArrayList<Int>()
+                  val first = set.first(); st.add(first); seen.add(first)
+                  while (st.isNotEmpty()) {
+                      val v = st.removeAt(st.size - 1)
+                      for (n in intArrayOf(v + 10, v - 10, v + 1, v - 1)) if (n in set && seen.add(n)) st.add(n)
+                  }
+                  return seen.size == set.size
+              }
           }
 
           object Solver {
@@ -261,8 +362,21 @@ jobs:
                   val rows = (0 until N).filter { i -> n[i].all { it == 1 } }
                   val cols = (0 until N).filter { j -> (0 until N).all { n[it][j] == 1 } }
                   for (i in rows) n[i].fill(0)
-                  for (j in cols) for (i in 0 until N) n[i][j] = 0
+                                    for (j in cols) for (i in 0 until N) n[i][j] = 0
                   return n to (rows.size + cols.size)
+              }
+              private var rewS = 1.0   // how much line clears are worth (set per plan from the goal)
+              private var mobW = 1.5   // how much staying alive is worth
+              private fun reward(l: Int) = rewS * (10.0 * l + 6.0 * l * (l - 1))   // multi-line clears are worth more than the sum
+              /** How many common shapes can still be placed: a direct measure of staying alive. */
+              private fun mobility(g: Array<IntArray>): Int {
+                  var n = 0
+                  for (s in Lib.shapes) {
+                      var ok = false
+                      loop@ for (r in 0..N - s.h) for (c in 0..N - s.w) if (fits(g, s, r, c)) { ok = true; break@loop }
+                      if (ok) n++
+                  }
+                  return n
               }
               private fun eval(g: Array<IntArray>): Double {
                   var p = 0.0; var f = 0
@@ -280,28 +394,71 @@ jobs:
                   }
                   return -p - f * .35
               }
-              /** Searches all orders of the visible pieces (beam 8 per level) and returns the best move sequence. */
-              fun plan(g: Array<IntArray>, ps: List<Shape?>): List<Move>? {
-                  var bv = -1e18; var bs: List<Move>? = null
+              private class Leaf(val v: Double, val seq: List<Move>, val board: Array<IntArray>)
+
+              /** Rows and columns that a placement would complete (for statistics). */
+              fun lines(g: Array<IntArray>, s: Shape, r: Int, c: Int): Pair<Int, Int> {
+                  val n = Array(N) { g[it].clone() }
+                  for (p in s.cells) n[r + p[0]][c + p[1]] = 1
+                  return (0 until N).count { i -> n[i].all { it == 1 } } to (0 until N).count { j -> (0 until N).all { n[it][j] == 1 } }
+              }
+
+              /** Monte Carlo: play 3 random pieces greedily from this board; low value if the board dies. */
+              private fun rollout(g: Array<IntArray>, rnd: java.util.Random): Double {
+                  var b = g; var total = 0.0
+                  for (k in 0 until 3) {
+                      val s = Lib.shapes[rnd.nextInt(Lib.shapes.size)]
+                      var bestV = -1e18; var bestB: Array<IntArray>? = null; var bestL = 0
+                      for (r in 0..N - s.h) for (c in 0..N - s.w) if (fits(b, s, r, c)) {
+                          val (nb, l) = place(b, s, r, c)
+                          val v = eval(nb) + reward(l)
+                          if (v > bestV) { bestV = v; bestB = nb; bestL = l }
+                      }
+                      val nb2 = bestB ?: return total - 50.0
+                      b = nb2; total += reward(bestL)
+                  }
+                  return total + eval(b) * 0.2
+              }
+
+              /**
+               * mode: 0 = greedy, 1 = beam search, 2 = beam search + Monte Carlo.
+               * goal: 0 = survival (keep the board open), 1 = high score (chase line clears).
+               */
+              fun plan(g: Array<IntArray>, ps: List<Shape?>, mode: Int = 1, goal: Int = 0): List<Move>? {
+                  rewS = if (goal == 1) 1.4 else 0.8
+                  mobW = if (mode == 0) 0.0 else if (goal == 1) 1.0 else 3.0
+                  if (mode > 0 && g.sumOf { it.sum() } >= 36) { mobW = 4.0; rewS = 1.0 }   // dangerous board: switch to survival
+                  val beam = when (mode) { 0 -> 1; 2 -> 10; else -> 8 }
+                  val leaves = ArrayList<Leaf>()
                   fun rec(g: Array<IntArray>, rem: List<Int>, seq: List<Move>, bonus: Double) {
                       var any = false
                       for (i in rem) {
                           val s = ps[i]!!
                           val cand = placements(g, s).map { (r, c) ->
-                              val a = place(g, s, r, c); Triple(intArrayOf(r, c), a, eval(a.first) + a.second * 8)
-                          }.sortedByDescending { it.third }.take(8)
+                              val a = place(g, s, r, c); Triple(intArrayOf(r, c), a, eval(a.first) + reward(a.second))
+                          }.sortedByDescending { it.third }.take(beam)
                           for (m in cand) {
                               any = true
-                              rec(m.second.first, rem - i, seq + Move(i, m.first[0], m.first[1]), bonus + m.second.second * 8)
+                              rec(m.second.first, rem - i, seq + Move(i, m.first[0], m.first[1]), bonus + reward(m.second.second))
                           }
                       }
-                      if (!any && seq.isNotEmpty()) {
-                          val v = bonus + eval(g) - 60.0 * rem.size
-                          if (v > bv) { bv = v; bs = seq }
-                      }
+                      if (!any && seq.isNotEmpty()) leaves.add(Leaf(bonus + eval(g) + mobW * mobility(g) - 60.0 * rem.size, seq, g))
                   }
                   rec(g, ps.indices.filter { ps[it] != null }, emptyList(), 0.0)
-                  return bs
+                  if (leaves.isEmpty()) return null
+                  leaves.sortByDescending { it.v }
+                  if (mode == 2) {
+                      val rnd = java.util.Random()
+                      var best = leaves[0]; var bv = -1e18
+                      for (lf in leaves.take(12)) {
+                          var sum = 0.0
+                          for (k in 0 until 10) sum += rollout(lf.board, rnd)
+                          val v = lf.v + 0.5 * sum / 10.0
+                          if (v > bv) { bv = v; best = lf }
+                      }
+                      return best.seq
+                  }
+                  return leaves[0].seq
               }
           }
 
@@ -324,6 +481,28 @@ jobs:
                   Color.colorToHSV(px[y * W + x], hsv)
                   return hsv[1] > 0.4f && hsv[2] > 0.55f   // filled blocks are saturated + bright, empty cells are dark
               }
+              private fun hsvAt(fx: Float, fy: Float): FloatArray {
+                  val x = (fx * W).toInt().coerceIn(0, W - 1); val y = (fy * H).toInt().coerceIn(0, H - 1)
+                  return FloatArray(3).also { Color.colorToHSV(px[y * W + x], it) }
+              }
+              /** Game-over screen: purple background with a gold "play" button in the middle. */
+              fun isGameOver(): Boolean {
+                  fun gold(fx: Float, fy: Float) = hsvAt(fx, fy).let { it[0] in 30f..55f && it[1] > 0.6f && it[2] > 0.7f }
+                  fun purple(fx: Float, fy: Float) = hsvAt(fx, fy).let { it[0] in 245f..295f && it[1] > 0.4f }
+                  return gold(0.30f, 0.69f) && gold(0.70f, 0.69f) && purple(0.08f, 0.50f) && purple(0.92f, 0.80f)
+              }
+              /** Does this screenshot look like the in-game screen: blue background around a dark 8x8 board? */
+              fun isGameScreen(): Boolean {
+                  fun bgBlue(fx: Float, fy: Float) = hsvAt(fx, fy).let { it[0] in 205f..240f && it[1] in 0.35f..0.8f && it[2] in 0.4f..0.72f }
+                  val bg = listOf(0.012f to 0.35f, 0.012f to 0.6f, 0.988f to 0.35f, 0.988f to 0.6f).count { bgBlue(it.first, it.second) }
+                  if (bg < 3) return false
+                  var dark = 0; var filled = 0
+                  for (r in 0 until 8) for (k in 0 until 8) {
+                      val o = hsvAt((bl + (k + .5f) * cell) / W, (bt + (r + .5f) * cell) / H)
+                      if (o[0] in 215f..255f && o[1] > 0.3f && o[2] < 0.5f) dark++ else if (o[1] > 0.4f && o[2] > 0.55f) filled++
+                  }
+                  return dark >= 2 && dark + filled >= 60   // every cell must be an empty-navy cell or a bright block
+              }
               fun board() = Array(8) { r -> IntArray(8) { k -> if (on((bl + (k + .5f) * cell).toInt(), (bt + (r + .5f) * cell).toInt())) 1 else 0 } }
               fun pieces(): List<Shape?> {
                   val ty = (c.f("ty") * H).toInt(); val th = (c.f("th") * H).toInt()
@@ -339,9 +518,9 @@ jobs:
                           val cols = (bw / pc).roundToInt().coerceIn(1, 5); val rows = (bh / pc).roundToInt().coerceIn(1, 5)
                           val cw = bw / cols.toFloat(); val ch = bh / rows.toFloat()
                           val cells = ArrayList<IntArray>()
-                                                    for (r in 0 until rows) for (k in 0 until cols)
+                          for (r in 0 until rows) for (k in 0 until cols)
                               if (piece((mnx + (k + .5f) * cw).toInt(), (mny + (r + .5f) * ch).toInt())) cells.add(intArrayOf(r, k))
-                          Shape(cells, cols, rows, mnx + bw / 2f, mny + bh / 2f)
+                          if (cells.isEmpty()) null else Shape(cells, cols, rows, mnx + bw / 2f, mny + bh / 2f)
                       }
                   }
               }
@@ -354,7 +533,7 @@ jobs:
                   val c = Canvas(bm); val cell = v.cell; val W = bm.width.toFloat()
                   val p = Paint(Paint.ANTI_ALIAS_FLAG); p.textSize = W / 24f
                   p.style = Paint.Style.STROKE; p.strokeWidth = 4f; p.color = Color.CYAN
-                  c.drawRect(v.bl, v.bt, v.bl + cell * 8, v.bt + cell * 8, p)
+                                    c.drawRect(v.bl, v.bt, v.bl + cell * 8, v.bt + cell * 8, p)
                   p.style = Paint.Style.FILL
                   for (r in 0 until 8) for (k in 0 until 8) {
                       p.color = if (g[r][k] == 1) Color.GREEN else Color.RED
@@ -394,6 +573,60 @@ jobs:
                   return bm
               }
           }
+
+          /** Statistics, move history and saving to stats.json. */
+          object Stats {
+              var score = 0; var best = 0; var placed = 0; var attempts = 0
+              var rows = 0; var cols = 0; var exact = 0; var samples = 0; var completed = 0
+              var playMs = 0L
+              private var clock = 0L
+              private val hist = ArrayList<String>()
+              private var loaded = false
+              val games: Int get() = completed + 1
+
+              @Synchronized fun load(ctx: Context) {
+                  if (loaded) return
+                  loaded = true
+                  try {
+                      val f = java.io.File(ctx.filesDir, "stats.json")
+                      if (!f.exists()) return
+                      val j = org.json.JSONObject(f.readText())
+                      best = j.optInt("best"); placed = j.optInt("placed"); attempts = j.optInt("attempts")
+                      rows = j.optInt("rows"); cols = j.optInt("cols"); exact = j.optInt("exact")
+                      samples = j.optInt("samples"); completed = j.optInt("completed"); playMs = j.optLong("playMs")
+                  } catch (e: Exception) {}
+              }
+              @Synchronized fun save(ctx: Context) {
+                  try {
+                      val j = org.json.JSONObject()
+                      j.put("best", best); j.put("placed", placed); j.put("attempts", attempts)
+                      j.put("rows", rows); j.put("cols", cols); j.put("exact", exact)
+                      j.put("samples", samples); j.put("completed", completed); j.put("playMs", playMs)
+                      java.io.File(ctx.filesDir, "stats.json").writeText(j.toString())
+                  } catch (e: Exception) {}
+              }
+              @Synchronized fun startClock() { if (clock == 0L) clock = System.currentTimeMillis() }
+              @Synchronized fun stopClock() { if (clock != 0L) { playMs += System.currentTimeMillis() - clock; clock = 0L } }
+              @Synchronized fun newGame() { completed++; best = maxOf(best, score); score = 0; hist.add("--- van moi ---"); if (hist.size > 30) hist.removeAt(0) }
+              @Synchronized fun resetSession() { score = 0; hist.clear() }
+              @Synchronized fun onPlaced(cells: Int, r: Int, c: Int, piece: Int, row: Int, col: Int, isExact: Boolean, measured: Boolean) {
+                  placed++; rows += r; cols += c
+                  score += cells + 10 * (r + c) * (r + c)     // estimate: the real in-game score is not readable without OCR
+                  best = maxOf(best, score)
+                  if (measured) { samples++; if (isExact) exact++ }
+                  hist.add("Khoi $piece -> hang ${row + 1}, cot ${col + 1}" + if (r + c > 0) " (an $r hang, $c cot)" else "")
+                  if (hist.size > 30) hist.removeAt(0)
+              }
+              @Synchronized fun history(): String = hist.takeLast(15).reversed().joinToString("\n")
+              @Synchronized fun text(): String {
+                  val t = playMs + if (clock != 0L) System.currentTimeMillis() - clock else 0L
+                  val sec = t / 1000
+                  val rate = if (attempts > 0) 100 * placed / attempts else 0
+                  val acc = if (samples > 0) 100 * exact / samples else 0
+                  return "Diem uoc tinh: $score | Cao nhat: $best\nKhoi da dat: $placed | Hang an: $rows | Cot an: $cols\n" +
+                      "Ti le dat thanh cong: $rate% | Do chinh xac du doan: $acc%\nVan hoan thanh: $completed | Thoi gian choi: ${sec / 60}p${sec % 60}s"
+              }
+          }
           EOF_3
           mkdir -p BlastBot/app/src/main/java/com/nyx/blastbot
           cat > BlastBot/app/src/main/java/com/nyx/blastbot/MainActivity.kt <<'EOF_4'
@@ -420,10 +653,17 @@ jobs:
               private lateinit var dbg: ImageView
               private lateinit var dbgLab: TextView
               private lateinit var resBox: LinearLayout
+              private lateinit var statsTv: TextView
+              private lateinit var histTv: TextView
 
               // The live debug image refreshes by itself whenever a new one is saved.
               private val poll = object : Runnable {
-                  override fun run() { refreshDebug(); h.postDelayed(this, 1000) }
+                  override fun run() {
+                      refreshDebug()
+                      statsTv.text = Stats.text()
+                      histTv.text = "Lich su nuoc di:\n" + Stats.history()
+                      h.postDelayed(this, 1000)
+                  }
               }
               private fun refreshDebug() {
                   val f = File(getExternalFilesDir(null), "debug.jpg")
@@ -439,18 +679,39 @@ jobs:
               override fun onCreate(s: Bundle?) {
                   super.onCreate(s)
                   val cfg = Cfg(this)
+                  Stats.load(this)
                   val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(32, 64, 32, 32) }
                   fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; setOnClickListener { f() } }.also { root.addView(it) }
                   root.addView(TextView(this).apply {
                       text = "BlastBot\n1) Bat Tro nang cho BlastBot\n2) Bam BAT DAU, roi mo Block Blast\n3) Tren man hinh game co nut BAT DAU / DUNG noi"
                   })
                   btn("Mo cai dat Tro nang") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-                  btn("BAT DAU") {
-                      val svc = BotService.inst
-                      if (svc == null) Toast.makeText(this, "Chua bat dich vu Tro nang", Toast.LENGTH_LONG).show()
-                      else { svc.setPlaying(true); Toast.makeText(this, "Da bat dau. Mo Block Blast de bot tu choi.", Toast.LENGTH_LONG).show() }
+                  fun svc(f: (BotService) -> Unit) {
+                      val s0 = BotService.inst
+                      if (s0 == null) Toast.makeText(this, "Chua bat dich vu Tro nang", Toast.LENGTH_LONG).show() else f(s0)
                   }
-                  btn("DUNG") { BotService.inst?.setPlaying(false) }
+                  btn("BAT DAU (van moi)") { svc { it.setPlaying(true); Stats.resetSession(); Toast.makeText(this, "Da bat dau. Mo Block Blast de bot tu choi.", Toast.LENGTH_LONG).show() } }
+                  btn("TAM DUNG") { svc { it.setPlaying(false) } }
+                  btn("TIEP TUC") { svc { it.setPlaying(true) } }
+                  btn("DUNG HAN") { svc { it.setPlaying(false); Stats.resetSession() } }
+
+                  fun spin(label: String, items: List<String>, cur: Int, set: (Int) -> Unit) {
+                      root.addView(TextView(this).apply { text = label })
+                      root.addView(Spinner(this).apply {
+                          adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items)
+                          setSelection(cur)
+                          onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                              override fun onItemSelected(p: AdapterView<*>?, v: android.view.View?, pos: Int, id: Long) { set(pos) }
+                              override fun onNothingSelected(p: AdapterView<*>?) {}
+                          }
+                      })
+                  }
+                  spin("Che do AI", listOf("DE: tham lam", "THONG MINH: tim kiem nhieu buoc", "NANG CAO: tim kiem + Monte Carlo"), cfg.mode) { cfg.mode = it }
+                  spin("Muc tieu", listOf("SINH TON: giu ban co thoang", "DIEM CAO: uu tien an nhieu hang"), cfg.goal) { cfg.goal = it }
+                  statsTv = TextView(this).apply { text = Stats.text() }
+                  root.addView(statsTv)
+                  histTv = TextView(this).apply { text = "Lich su nuoc di:" }
+                  root.addView(histTv)
 
                   val lab = TextView(this).apply { text = "Thoi gian moi buoc: ${cfg.sec} giay (1-60)" }
                   root.addView(lab)
@@ -466,9 +727,14 @@ jobs:
                       text = "Luu anh debug moi lan chup"; isChecked = cfg.live; setOnCheckedChangeListener { _, v -> cfg.live = v }
                   })
 
+                  root.addView(Switch(this).apply {
+                      text = "Tu bam Choi lai khi thua"; isChecked = cfg.replay; setOnCheckedChangeListener { _, v -> cfg.replay = v }
+                  })
+
                   val labels = mapOf("bl" to "le trai ban (x/rong man)", "bt" to "dinh ban (y/cao man)", "bs" to "do rong ban (/rong man)",
                       "ty" to "dinh khay khoi (y/cao man)", "th" to "cao khay khoi", "ps" to "ti le o khoi trong khay so voi ban",
-                      "dy" to "lech tha theo Y (don vi o, vd -1 hoac 1.5)")
+                      "dy" to "lech tha theo Y (don vi o, vd -1 hoac 1.5)",
+                      "dur" to "thoi gian keo khoi (giay, 0.15 - 1.0; nho = nhanh)")
                   val pk = EditText(this).apply { setText(cfg.pkg) }
                   root.addView(TextView(this).apply { text = "package game" }); root.addView(pk)
                   val ed = HashMap<String, EditText>()
@@ -513,8 +779,10 @@ jobs:
                   if (bmp == null) { say("Khong doc duoc anh"); return }
                   val cfg = Cfg(this)
                   val v = Vision(bmp, cfg); val g = v.board(); val ps = v.pieces()
+                  if (v.isGameOver()) { say("Day la man hinh THUA (Game Over), khong co nuoc di de tinh. Bot se tu bam nut Choi lai."); return }
+                  if (!v.isGameScreen()) { say("Anh nay KHONG giong man choi Block Blast (nen xanh, ban co 8x8 mau toi), nen bo qua, khong tinh nuoc di."); return }
                   val n = ps.count { it != null }
-                  val plan = if (n > 0) Solver.plan(g, ps) else null
+                  val plan = if (n > 0) Solver.plan(g, ps, cfg.mode, cfg.goal) else null
                   val k = plan?.size ?: 0
                   say("Thay $n khoi trong khay, co $k anh ket qua." + if (n > k) " (co khoi khong dat duoc)" else "")
                   for (i in 0 until k) {
@@ -565,3 +833,4 @@ jobs:
         with:
           name: BlastBot-apk
           path: BlastBot/app/build/outputs/apk/debug/app-debug.apk
+          
